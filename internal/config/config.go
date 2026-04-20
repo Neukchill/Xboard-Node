@@ -720,7 +720,7 @@ func (c *Config) validate() error {
 		}
 	}
 	switch c.Kernel.Type {
-	case "singbox", "xray":
+	case "singbox", "xray", "sudoku":
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
 	}
