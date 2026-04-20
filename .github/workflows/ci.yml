@@ -100,7 +100,6 @@ jobs:
           tags: |
 		  ghcr.io/neukchill/xboard-node:latest
 		  ghcr.io/neukchill/xboard-node:${{ github.sha }}
-		  ${{ startsWith(github.ref, 'refs/tags/') && format('ghcr.io/neukchill/xboard-node:{0}', github.ref_name) || '' }}
 
   release:
     name: Release
