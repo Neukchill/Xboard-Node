@@ -36,8 +36,10 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	if err := ValidateCustomRouteRules(n.CustomRouteRules, kernelType, availableTags); err != nil {
 		return fmt.Errorf("validate custom route rules: %w", err)
 	}
-	if err := validateTransportKernel(n.Network, kernelType); err != nil {
-		return err
+	if kernelType != "sudoku" {
+		if err := validateTransportKernel(n.Network, kernelType); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -50,10 +52,8 @@ var singboxUnsupportedTransports = map[string]bool{
 
 func validateTransportKernel(network, kernelType string) error {
 	net := strings.ToLower(strings.TrimSpace(network))
-	if kernelType != "sudoku" {
-	    if err := validateTransportKernel(n.Network, kernelType); err != nil {
-	        return err
-	    }
+	if kernelType == "singbox" && singboxUnsupportedTransports[net] {
+		return fmt.Errorf("transport %q is not supported by sing-box kernel; use xray kernel instead", net)
 	}
 	return nil
 }
