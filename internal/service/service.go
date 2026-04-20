@@ -20,6 +20,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/singbox"
 	"github.com/cedar2025/xboard-node/internal/kernel/xray"
+	 sudokukernel "github.com/cedar2025/xboard-node/internal/kernel/sudoku"
 	"github.com/cedar2025/xboard-node/internal/limiter"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/monitor"
@@ -144,6 +145,8 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		k = singbox.New(cfg.Kernel)
 	case "xray":
 		k = xray.New(cfg.Kernel)
+	case "sudoku":
+    		k = sudokukernel.New()
 	default:
 		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
 		k = singbox.New(cfg.Kernel)

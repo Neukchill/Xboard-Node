@@ -50,8 +50,10 @@ var singboxUnsupportedTransports = map[string]bool{
 
 func validateTransportKernel(network, kernelType string) error {
 	net := strings.ToLower(strings.TrimSpace(network))
-	if kernelType == "singbox" && singboxUnsupportedTransports[net] {
-		return fmt.Errorf("transport %q is not supported by sing-box kernel; use xray kernel instead", net)
+	if kernelType != "sudoku" {
+	    if err := validateTransportKernel(n.Network, kernelType); err != nil {
+	        return err
+	    }
 	}
 	return nil
 }
@@ -74,6 +76,8 @@ func normalizeKernelType(value string) (string, error) {
 		return "singbox", nil
 	case "xray":
 		return "xray", nil
+	case "sudoku":
+    		return "sudoku", nil
 	default:
 		return "", fmt.Errorf("unsupported kernel type %q", value)
 	}
