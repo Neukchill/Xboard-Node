@@ -2,7 +2,9 @@ package sudoku
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,211 +12,267 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	sudokuapis "github.com/SUDOKU-ASCII/sudoku/apis"
+	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
 
-// userEntry stores everything we need for a live user.
+// NodeSettings holds node-level (shared across all users) configuration.
+type NodeSettings struct {
+	// Table/obfuscation settings
+	TableType          string // e.g. "up_ascii_down_entropy"
+	CustomTable        string // e.g. "vpvpvvxx" (optional)
+	AEADMethod         string // "chacha20-poly1305" or "aes-128-gcm"
+	PaddingMin         int
+	PaddingMax         int
+	EnablePureDownlink bool
+
+	// HTTP mask settings
+	HTTPMaskMode     string // "legacy","ws","stream","poll","auto"
+	HTTPMaskPathRoot string // optional path prefix
+	HTTPMaskMux      string // "off","auto","on"
+
+	// Per-user key derivation
+	KeySalt string // random salt stored in node config
+
+	// Server settings
+	HandshakeTimeout int // seconds (default 10)
+	Listen           string
+	TLSConfig        *tls.Config
+}
+
+// userEntry represents a registered user with their derived key and protocol config.
 type userEntry struct {
 	id   int
 	uuid string
+	salt string
+	key  string              // derived: hex(sha256(uuid+salt))
+	cfg  *sudokuapis.ProtocolConfig
 }
 
-// trafficCounter holds atomic upload / download byte counts for one user.
+// deriveKey computes the per-user PSK from UUID and node salt.
+func deriveKey(uuid, salt string) string {
+	h := sha256.Sum256([]byte(uuid + salt))
+	return fmt.Sprintf("%x", h[:])
+}
+
+// buildConfig creates the ProtocolConfig for a single user given their key and node settings.
+func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
+	var table *sudokutable.Table
+	if s.CustomTable != "" {
+		t, err := sudokutable.NewTableWithCustom(key, s.TableType, s.CustomTable)
+		if err != nil {
+			// Fall back to standard table on invalid custom pattern
+			t = sudokutable.NewTable(key, s.TableType)
+		}
+		table = t
+	} else {
+		table = sudokutable.NewTable(key, s.TableType)
+	}
+
+	timeout := s.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = 10
+	}
+
+	method := s.AEADMethod
+	if method == "" {
+		method = "chacha20-poly1305"
+	}
+
+	return &sudokuapis.ProtocolConfig{
+		Key:                     key,
+		AEADMethod:              method,
+		Table:                   table,
+		PaddingMin:              s.PaddingMin,
+		PaddingMax:              s.PaddingMax,
+		EnablePureDownlink:      s.EnablePureDownlink,
+		HandshakeTimeoutSeconds: timeout,
+		HTTPMaskMode:            s.HTTPMaskMode,
+		HTTPMaskPathRoot:        s.HTTPMaskPathRoot,
+		HTTPMaskMultiplex:       s.HTTPMaskMux,
+		// HTTPMaskTLSEnabled is client-only; server uses the TLS listener.
+	}
+}
+
+// trafficCounter holds per-user atomic byte counters.
 type trafficCounter struct {
 	upload   atomic.Int64
 	download atomic.Int64
 }
 
-// connRecord tracks a single live connection.
+// connRecord tracks a live proxied connection.
 type connRecord struct {
-	id     string // remote addr string used as identifier
+	userID int
 	uuid   string
 	client net.Conn
-	target net.Conn
 }
 
-// ServerConfig is the runtime configuration for the Sudoku proxy server.
-type ServerConfig struct {
-	Listen    string     // e.g. "0.0.0.0:12345"
-	TLSConfig *tls.Config // nil = plain TCP
-
-	// Speed-limit callback (nil = no limit). Returns a token bucket limited
-	// io.Writer; the server wraps uploads through it.
-	SpeedLimitFn func(uuid string) (downloadBytesPerSec int64, ok bool)
-}
-
-// Server is the running Sudoku proxy server.
+// Server is the running Sudoku multi-user proxy server.
 type Server struct {
-	cfg      ServerConfig
-	listener net.Listener
+	settings NodeSettings
 	log      *slog.Logger
+	listener net.Listener
+	ctx      context.Context
+	cancel   context.CancelFunc
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	usersMu sync.RWMutex
+	users   []userEntry // ordered list; sequential probe tries in this order
 
-	// user set (keyed by UUID for fast lookup during auth)
-	usersMu  sync.RWMutex
-	byUUID   map[string]userEntry // uuid → entry
-	byID     map[int]userEntry    // id → entry
-
-	// traffic counters (keyed by user id, created lazily)
 	trafficMu sync.Mutex
 	traffic   map[int]*trafficCounter
 
-	// live connections
-	connsMu sync.RWMutex
-	conns   map[string]*connRecord
-
-	// connection counter for metrics
-	activeConns atomic.Int64
-	totalConns  atomic.Int64
+	connsMu    sync.RWMutex
+	conns      map[string]*connRecord
+	activeConn atomic.Int64
+	totalConn  atomic.Int64
 }
 
-// NewServer creates a server but does not start it.
-func NewServer(cfg ServerConfig, log *slog.Logger) *Server {
+// NewServer creates a Server (not yet started).
+func NewServer(settings NodeSettings, log *slog.Logger) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		cfg:     cfg,
-		log:     log,
-		ctx:     ctx,
-		cancel:  cancel,
-		byUUID:  make(map[string]userEntry),
-		byID:    make(map[int]userEntry),
-		traffic: make(map[int]*trafficCounter),
-		conns:   make(map[string]*connRecord),
+		settings: settings,
+		log:      log,
+		ctx:      ctx,
+		cancel:   cancel,
+		traffic:  make(map[int]*trafficCounter),
+		conns:    make(map[string]*connRecord),
 	}
 }
 
-// Start begins accepting connections. Non-blocking; returns once the
-// listener is bound.
+// Start binds the listener and begins accepting connections.
 func (s *Server) Start() error {
 	var ln net.Listener
 	var err error
-
-	if s.cfg.TLSConfig != nil {
-		ln, err = tls.Listen("tcp", s.cfg.Listen, s.cfg.TLSConfig)
+	if s.settings.TLSConfig != nil {
+		ln, err = tls.Listen("tcp", s.settings.Listen, s.settings.TLSConfig)
 	} else {
-		ln, err = net.Listen("tcp", s.cfg.Listen)
+		ln, err = net.Listen("tcp", s.settings.Listen)
 	}
 	if err != nil {
-		return fmt.Errorf("sudoku server: listen %s: %w", s.cfg.Listen, err)
+		return fmt.Errorf("sudoku: listen %s: %w", s.settings.Listen, err)
 	}
 	s.listener = ln
-	s.log.Info("sudoku server listening", "addr", s.cfg.Listen, "tls", s.cfg.TLSConfig != nil)
-
+	s.log.Info("sudoku server listening", "addr", s.settings.Listen, "tls", s.settings.TLSConfig != nil)
 	go s.acceptLoop()
 	return nil
 }
 
-// Stop shuts down the server gracefully.
+// Stop shuts down the server and all active connections.
 func (s *Server) Stop() {
 	s.cancel()
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
-	// Close all live connections.
 	s.connsMu.Lock()
-	for _, rec := range s.conns {
-		_ = rec.client.Close()
-		if rec.target != nil {
-			_ = rec.target.Close()
-		}
+	for _, r := range s.conns {
+		_ = r.client.Close()
 	}
 	s.connsMu.Unlock()
 }
 
-// UpdateUsers atomically replaces the entire user set.
-// Returns (added, removed) counts relative to the old set.
-func (s *Server) UpdateUsers(users []userEntry) (added, removed int) {
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
-
-	newByUUID := make(map[string]userEntry, len(users))
-	newByID := make(map[int]userEntry, len(users))
-	for _, u := range users {
-		newByUUID[u.uuid] = u
-		newByID[u.id] = u
+// UpdateUsers atomically replaces the full user list.
+// Returns (added, removed) counts.
+func (s *Server) UpdateUsers(entries []userEntry) (added, removed int) {
+	// Populate derived key + config for each entry
+	filled := make([]userEntry, 0, len(entries))
+	for _, e := range entries {
+		e.key = deriveKey(e.uuid, e.salt)
+		e.cfg = buildConfig(e.key, s.settings)
+		filled = append(filled, e)
 	}
 
-	for uuid := range newByUUID {
-		if _, exists := s.byUUID[uuid]; !exists {
+	s.usersMu.Lock()
+	old := s.users
+	s.users = filled
+	s.usersMu.Unlock()
+
+	oldSet := make(map[int]struct{}, len(old))
+	for _, u := range old {
+		oldSet[u.id] = struct{}{}
+	}
+	newSet := make(map[int]struct{}, len(filled))
+	for _, u := range filled {
+		newSet[u.id] = struct{}{}
+	}
+	for id := range newSet {
+		if _, exists := oldSet[id]; !exists {
 			added++
 		}
 	}
-	for uuid := range s.byUUID {
-		if _, exists := newByUUID[uuid]; !exists {
+	for id := range oldSet {
+		if _, exists := newSet[id]; !exists {
 			removed++
 		}
 	}
-
-	s.byUUID = newByUUID
-	s.byID = newByID
 	return
 }
 
-// AddUsers registers additional users without touching the existing set.
-// Returns the number actually added (duplicates skipped).
-func (s *Server) AddUsers(users []userEntry) int {
+// AddUsers appends users not already registered. Returns added count.
+func (s *Server) AddUsers(entries []userEntry) int {
 	s.usersMu.Lock()
 	defer s.usersMu.Unlock()
 
+	existing := make(map[int]struct{}, len(s.users))
+	for _, u := range s.users {
+		existing[u.id] = struct{}{}
+	}
 	added := 0
-	for _, u := range users {
-		if _, exists := s.byUUID[u.uuid]; !exists {
-			s.byUUID[u.uuid] = u
-			s.byID[u.id] = u
-			added++
+	for _, e := range entries {
+		if _, ok := existing[e.id]; ok {
+			continue
 		}
+		e.key = deriveKey(e.uuid, e.salt)
+		e.cfg = buildConfig(e.key, s.settings)
+		s.users = append(s.users, e)
+		existing[e.id] = struct{}{}
+		added++
 	}
 	return added
 }
 
-// RemoveUsers deregisters the given users. Active connections for removed
-// users are closed. Returns the number actually removed.
-func (s *Server) RemoveUsers(users []userEntry) int {
-	s.usersMu.Lock()
+// RemoveUsers removes users by ID. Returns removed count.
+func (s *Server) RemoveUsers(ids []int) int {
+	removeSet := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		removeSet[id] = struct{}{}
+	}
 
-	removed := 0
+	s.usersMu.Lock()
 	var kickUUIDs []string
-	for _, u := range users {
-		if _, exists := s.byUUID[u.uuid]; exists {
-			delete(s.byUUID, u.uuid)
-			delete(s.byID, u.id)
+	newUsers := s.users[:0]
+	for _, u := range s.users {
+		if _, remove := removeSet[u.id]; remove {
 			kickUUIDs = append(kickUUIDs, u.uuid)
-			removed++
+		} else {
+			newUsers = append(newUsers, u)
 		}
 	}
+	removed := len(s.users) - len(newUsers)
+	s.users = newUsers
 	s.usersMu.Unlock()
 
-	// Close connections for removed users.
 	for _, uuid := range kickUUIDs {
-		s.closeUserConns(uuid)
+		s.CloseUserConns(uuid)
 	}
 	return removed
 }
 
-// CloseUserConns closes all active connections for the given UUID.
+// CloseUserConns forcibly closes all connections for the given UUID.
 func (s *Server) CloseUserConns(uuid string) {
-	s.closeUserConns(uuid)
-}
-
-// closeUserConns is the internal (no lock on usersMu) implementation.
-func (s *Server) closeUserConns(uuid string) {
 	s.connsMu.Lock()
 	defer s.connsMu.Unlock()
-
-	for id, rec := range s.conns {
-		if rec.uuid == uuid {
-			_ = rec.client.Close()
-			if rec.target != nil {
-				_ = rec.target.Close()
-			}
+	for id, r := range s.conns {
+		if r.uuid == uuid {
+			_ = r.client.Close()
 			delete(s.conns, id)
+			s.activeConn.Add(-1)
 		}
 	}
 }
 
 // GetTraffic returns and resets per-user traffic counters.
-// Returns map[userID → [upload, download]].
 func (s *Server) GetTraffic() map[int][2]int64 {
 	s.trafficMu.Lock()
 	old := s.traffic
@@ -232,39 +290,39 @@ func (s *Server) GetTraffic() map[int][2]int64 {
 	return out
 }
 
-// GetAliveIPs returns per-user live source IPs.
-// Returns map[userID → set of IP strings].
+// GetAliveIPs returns per-user sets of currently connected source IPs.
 func (s *Server) GetAliveIPs() map[int]map[string]bool {
 	s.connsMu.RLock()
 	defer s.connsMu.RUnlock()
-
-	out := make(map[int]map[string]bool)
-
 	s.usersMu.RLock()
 	defer s.usersMu.RUnlock()
 
-	for _, rec := range s.conns {
-		u, ok := s.byUUID[rec.uuid]
+	uuidToID := make(map[string]int, len(s.users))
+	for _, u := range s.users {
+		uuidToID[u.uuid] = u.id
+	}
+
+	out := make(map[int]map[string]bool)
+	for _, r := range s.conns {
+		id, ok := uuidToID[r.uuid]
 		if !ok {
 			continue
 		}
-		if out[u.id] == nil {
-			out[u.id] = make(map[string]bool)
+		if out[id] == nil {
+			out[id] = make(map[string]bool)
 		}
-		host, _, err := net.SplitHostPort(rec.client.RemoteAddr().String())
+		host, _, err := net.SplitHostPort(r.client.RemoteAddr().String())
 		if err == nil {
-			out[u.id][host] = true
+			out[id][host] = true
 		}
 	}
 	return out
 }
 
-// ActiveConnCount returns the current number of live proxied connections.
-func (s *Server) ActiveConnCount() int {
-	return int(s.activeConns.Load())
-}
+// ActiveConnCount returns the number of live connections.
+func (s *Server) ActiveConnCount() int { return int(s.activeConn.Load()) }
 
-// ---- internal ---------------------------------------------------------------
+// ─── internal ─────────────────────────────────────────────────────────────────
 
 func (s *Server) acceptLoop() {
 	for {
@@ -283,86 +341,140 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-func (s *Server) handleConn(clientConn net.Conn) {
-	defer clientConn.Close()
+// handleConn authenticates an incoming connection by sequentially trying each
+// registered user's ProtocolConfig. On each failure, the HandshakeError carry
+// the bytes already consumed, which are prepended to the raw connection for the
+// next attempt (replay mechanism from the official API).
+func (s *Server) handleConn(rawConn net.Conn) {
+	defer rawConn.Close()
 
-	// 5-second handshake deadline.
-	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
-
+	// Snapshot the current user list.
 	s.usersMu.RLock()
-	uuids := make([]string, 0, len(s.byUUID))
-	for uuid := range s.byUUID {
-		uuids = append(uuids, uuid)
-	}
+	users := make([]userEntry, len(s.users))
+	copy(users, s.users)
 	s.usersMu.RUnlock()
 
-	uuid, cmd, addr, err := ReadHandshake(clientConn, uuids)
-	if err != nil {
-		s.log.Debug("handshake failed", "remote", clientConn.RemoteAddr(), "err", err)
-		_ = WriteReply(clientConn, RepAuthFail)
+	if len(users) == 0 {
+		s.log.Debug("no users registered, dropping connection", "remote", rawConn.RemoteAddr())
 		return
 	}
 
-	if cmd != CmdTCP {
-		_ = WriteReply(clientConn, RepCmdUnsupported)
-		return
+	// current is the "replay-capable" connection we pass to each attempt.
+	// It starts as the raw TCP conn; after each failure, it is rebuilt from
+	// the HandshakeError replay bytes + remaining raw conn.
+	var current net.Conn = rawConn
+
+	for _, user := range users {
+		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(current, user.cfg)
+		if err == nil {
+			// Authenticated! Start proxying.
+			s.proxy(conn, session, targetAddr, user)
+			return
+		}
+
+		// Check if replay is possible.
+		var hsErr *sudokuapis.HandshakeError
+		if !errors.As(err, &hsErr) {
+			// Non-replay error (e.g. network closed) — give up.
+			s.log.Debug("non-replay handshake error", "remote", rawConn.RemoteAddr(), "err", err)
+			return
+		}
+
+		// Rebuild the connection for the next user attempt by replaying
+		// the bytes already consumed: HTTPHeaderData + ReadData.
+		replayBytes := make([]byte, 0, len(hsErr.HTTPHeaderData)+len(hsErr.ReadData))
+		replayBytes = append(replayBytes, hsErr.HTTPHeaderData...)
+		replayBytes = append(replayBytes, hsErr.ReadData...)
+		current = sudokuapis.NewPreBufferedConn(hsErr.RawConn, replayBytes)
 	}
 
-	targetConn, err := net.DialTimeout("tcp", addr.String(), 10*time.Second)
-	if err != nil {
-		s.log.Error("dial target failed", "target", addr, "err", err)
-		_ = WriteReply(clientConn, RepAuthFail)
-		return
-	}
-	defer targetConn.Close()
+	s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
+}
 
-	if err = WriteReply(clientConn, RepSuccess); err != nil {
-		return
-	}
-	// Clear deadline for the data transfer phase.
-	_ = clientConn.SetDeadline(time.Time{})
+// proxy relays traffic between the authenticated tunnel connection and the target.
+func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr string, user userEntry) {
+	connID := conn.RemoteAddr().String()
 
 	// Register live connection.
-	connID := clientConn.RemoteAddr().String()
-	rec := &connRecord{id: connID, uuid: uuid, client: clientConn, target: targetConn}
 	s.connsMu.Lock()
-	s.conns[connID] = rec
+	s.conns[connID] = &connRecord{userID: user.id, uuid: user.uuid, client: conn}
 	s.connsMu.Unlock()
-	s.activeConns.Add(1)
-	s.totalConns.Add(1)
+	s.activeConn.Add(1)
+	s.totalConn.Add(1)
 
-	// Relay and count bytes.
-	up, dn := relay(clientConn, targetConn)
+	defer func() {
+		s.connsMu.Lock()
+		delete(s.conns, connID)
+		s.connsMu.Unlock()
+		s.activeConn.Add(-1)
+		_ = conn.Close()
+	}()
 
-	// Deregister.
-	s.connsMu.Lock()
-	delete(s.conns, connID)
-	s.connsMu.Unlock()
-	s.activeConns.Add(-1)
-
-	// Accumulate traffic.
-	s.usersMu.RLock()
-	u, ok := s.byUUID[uuid]
-	s.usersMu.RUnlock()
-	if ok && (up > 0 || dn > 0) {
-		s.trafficMu.Lock()
-		c, exists := s.traffic[u.id]
-		if !exists {
-			c = &trafficCounter{}
-			s.traffic[u.id] = c
+	switch session {
+	case sudokuapis.SessionUoT:
+		// UDP-over-TCP: the Sudoku library handles framing internally.
+		// We can't easily count per-packet bytes here; traffic will not be
+		// attributed for UoT sessions in this version.
+		if err := sudokuapis.HandleUoT(conn); err != nil {
+			s.log.Debug("UoT session ended", "uuid", user.uuid, "err", err)
 		}
-		s.trafficMu.Unlock()
-		c.upload.Add(up)
-		c.download.Add(dn)
+
+	case sudokuapis.SessionMux:
+		// Multiplexed session: use HandleMuxWithDialer to proxy sub-streams.
+		err := sudokuapis.HandleMuxWithDialer(conn,
+			func(addr string) { s.log.Debug("mux sub-stream", "uuid", user.uuid, "target", addr) },
+			func(addr string) (net.Conn, error) {
+				target, err := net.DialTimeout("tcp", addr, 10*time.Second)
+				if err != nil {
+					return nil, err
+				}
+				// Count traffic for each sub-connection.
+				return &countingConn{Conn: target, userID: user.id, srv: s}, nil
+			},
+		)
+		if err != nil {
+			s.log.Debug("mux session ended", "uuid", user.uuid, "err", err)
+		}
+
+	default: // SessionForward
+		// Standard TCP relay.
+		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		if err != nil {
+			s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
+			return
+		}
+		defer target.Close()
+
+		up, dn := relay(conn, target)
+		s.addTraffic(user.id, up, dn)
+		s.log.Debug("connection closed",
+			"uuid", user.uuid,
+			"target", targetAddr,
+			"upload", up,
+			"download", dn,
+		)
 	}
 }
 
-// relay copies data bidirectionally between client and target.
-// Returns (client→target bytes, target→client bytes).
+func (s *Server) addTraffic(userID int, upload, download int64) {
+	if upload == 0 && download == 0 {
+		return
+	}
+	s.trafficMu.Lock()
+	c, ok := s.traffic[userID]
+	if !ok {
+		c = &trafficCounter{}
+		s.traffic[userID] = c
+	}
+	s.trafficMu.Unlock()
+	c.upload.Add(upload)
+	c.download.Add(download)
+}
+
+// relay copies data in both directions and returns (upload, download) byte counts.
 func relay(client, target net.Conn) (upload, download int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
 		upload, _ = io.Copy(target, client)
@@ -370,7 +482,6 @@ func relay(client, target net.Conn) (upload, download int64) {
 			_ = tc.CloseWrite()
 		}
 	}()
-
 	go func() {
 		defer wg.Done()
 		download, _ = io.Copy(client, target)
@@ -378,7 +489,29 @@ func relay(client, target net.Conn) (upload, download int64) {
 			_ = tc.CloseWrite()
 		}
 	}()
-
 	wg.Wait()
+	return
+}
+
+// countingConn wraps a net.Conn and attributes bytes to a user.
+type countingConn struct {
+	net.Conn
+	userID int
+	srv    *Server
+}
+
+func (c *countingConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if n > 0 {
+		c.srv.addTraffic(c.userID, 0, int64(n))
+	}
+	return
+}
+
+func (c *countingConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if n > 0 {
+		c.srv.addTraffic(c.userID, int64(n), 0)
+	}
 	return
 }
