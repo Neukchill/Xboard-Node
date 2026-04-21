@@ -1,6 +1,6 @@
 module github.com/cedar2025/xboard-node
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/caddyserver/certmagic v0.25.2
@@ -19,7 +19,8 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/SUDOKU-ASCII/sudoku v0.4.3 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
@@ -177,4 +178,5 @@ require (
 )
 
 replace github.com/sagernet/sing-box => github.com/cedar2025/sing-box v1.14.0-alpha.2.0.20260316103356-2e665cb7e295
+
 replace github.com/xtls/xray-core => github.com/cedar2025/Xray-core v0.0.0-20260409213332-f47935539965
