@@ -25,7 +25,7 @@ docker run -d --restart=always --network=host \
 ### Docker Compose
 
 ```bash
-git clone -b compose --depth 1 https://github.com/cedar2025/xboard-node.git
+git clone -b compose --depth 1 https://github.com/Neukchill/xboard-node.git
 cd xboard-node
 vim config/config.yml   # set panel.url / token / node_id
 docker compose up -d
