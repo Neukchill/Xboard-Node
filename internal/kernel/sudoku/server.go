@@ -9,11 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	sudokuapis "github.com/SUDOKU-ASCII/sudoku/apis"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
 
@@ -116,6 +118,11 @@ type Server struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 
+	// httpmaskServer handles WebSocket / HTTP-tunnel upgrade for non-legacy modes
+	// (ws / stream / poll / auto). nil for legacy or no-mask mode.
+	// After the upgrade, the inner Sudoku handshake runs with DisableHTTPMask=true.
+	httpmaskServer *httpmask.TunnelServer
+
 	usersMu sync.RWMutex
 	users   []userEntry // ordered list; sequential probe tries in this order
 
@@ -143,6 +150,23 @@ func NewServer(settings NodeSettings, log *slog.Logger) *Server {
 
 // Start binds the listener and begins accepting connections.
 func (s *Server) Start() error {
+	// Initialize the HTTPMask tunnel server for non-legacy modes.
+	// This handles the outer WebSocket / HTTP-tunnel upgrade before the
+	// per-user Sudoku obfs handshake runs on the inner stream.
+	switch strings.ToLower(strings.TrimSpace(s.settings.HTTPMaskMode)) {
+	case "ws", "stream", "poll", "auto":
+		s.httpmaskServer = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
+			Mode:     s.settings.HTTPMaskMode,
+			PathRoot: s.settings.HTTPMaskPathRoot,
+			// AuthKey + EarlyHandshake are intentionally not set:
+			//   - AuthKey is single-key anti-probing; multi-user nodes
+			//     authenticate at the inner Sudoku layer instead.
+			//   - EarlyHandshake binds to one user's PSK/Table; not usable
+			//     for multi-user probing. The extra RTT is acceptable.
+			PassThroughOnReject: true,
+		})
+	}
+
 	var ln net.Listener
 	var err error
 	if s.settings.TLSConfig != nil {
@@ -154,7 +178,12 @@ func (s *Server) Start() error {
 		return fmt.Errorf("sudoku: listen %s: %w", s.settings.Listen, err)
 	}
 	s.listener = ln
-	s.log.Info("sudoku server listening", "addr", s.settings.Listen, "tls", s.settings.TLSConfig != nil)
+	s.log.Info("sudoku server listening",
+		"addr", s.settings.Listen,
+		"tls", s.settings.TLSConfig != nil,
+		"httpmask_mode", s.settings.HTTPMaskMode,
+		"httpmask_tunnel", s.httpmaskServer != nil,
+	)
 	go s.acceptLoop()
 	return nil
 }
@@ -359,13 +388,58 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		return
 	}
 
-	// current is the "replay-capable" connection we pass to each attempt.
-	// It starts as the raw TCP conn; after each failure, it is rebuilt from
-	// the HandshakeError replay bytes + remaining raw conn.
+	// Determine the connection that will be handed to the inner Sudoku probe loop,
+	// and whether the inner handshake should skip the HTTP-header peek.
+	//
+	// For ws / stream / poll / auto modes, the outer HTTPMask tunnel layer
+	// (WebSocket Upgrade or HTTP tunnel framing) is processed first. Only after
+	// that upgrade succeeds does the inner Sudoku obfs handshake run.
 	var current net.Conn = rawConn
+	disableInnerHTTPMask := false
 
+	if s.httpmaskServer != nil {
+		res, c, err := s.httpmaskServer.HandleConn(rawConn)
+		if err != nil {
+			s.log.Debug("httpmask tunnel error", "remote", rawConn.RemoteAddr(), "err", err)
+			return
+		}
+		switch res {
+		case httpmask.HandleDone:
+			// Tunnel server already handled and closed the connection
+			// (e.g. poll control request, rejected probe).
+			return
+		case httpmask.HandleStartTunnel:
+			// WS / stream upgrade succeeded. The returned conn carries the
+			// raw Sudoku stream. The inner handshake must skip its own
+			// HTTP-header peek because the bytes are already past that point.
+			current = c
+			disableInnerHTTPMask = true
+		case httpmask.HandlePassThrough:
+			// Not an HTTP tunnel request (or rejected with PassThroughOnReject).
+			// The returned conn replays any pre-read bytes; fall through to
+			// the legacy probe loop on it.
+			current = c
+		default:
+			return
+		}
+	}
+
+	// current is the "replay-capable" connection we pass to each attempt.
+	// After each handshake failure, it is rebuilt from the HandshakeError's
+	// replay bytes + remaining raw conn so the next user can retry.
 	for _, user := range users {
-		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(current, user.cfg)
+		// When the outer WS/stream/poll layer already consumed the HTTP
+		// part, clone the per-user cfg with DisableHTTPMask=true so that
+		// the inner handshake doesn't try to peek for HTTP again on the
+		// upgraded stream.
+		probeCfg := user.cfg
+		if disableInnerHTTPMask {
+			inner := *user.cfg
+			inner.DisableHTTPMask = true
+			probeCfg = &inner
+		}
+
+		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(current, probeCfg)
 		if err == nil {
 			// Authenticated! Start proxying.
 			s.proxy(conn, session, targetAddr, user)
