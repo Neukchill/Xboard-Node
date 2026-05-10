@@ -1,7 +1,6 @@
 package sudoku
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -18,37 +17,6 @@ import (
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
-
-// sinkConn is used exclusively for per-user probe attempts in handleConn.
-//
-// Reads come from an in-memory bytes.Reader so they are always instantaneous
-// and never block or interact with the real network connection.  Writes are
-// silently discarded so the library's "write server hello" step does not
-// fail during probing.  Deadline methods are no-ops so a probe cannot
-// disturb the real connection's read deadline.
-//
-// Because every byte is served from an already-complete in-memory snapshot,
-// any goroutine spawned internally by crypto.NewRecordConn will immediately
-// receive io.EOF when it tries to read beyond the available bytes and will
-// exit on its own — eliminating the goroutine-leak / lock-contention problem
-// that broke the previous replayableConn approach.
-type sinkConn struct {
-	reader  *bytes.Reader
-	realFor net.Conn // used only for LocalAddr / RemoteAddr
-}
-
-func newSinkConn(data []byte, realFor net.Conn) *sinkConn {
-	return &sinkConn{reader: bytes.NewReader(data), realFor: realFor}
-}
-
-func (c *sinkConn) Read(p []byte) (int, error)         { return c.reader.Read(p) }
-func (c *sinkConn) Write(p []byte) (int, error)        { return len(p), nil } // discard
-func (c *sinkConn) Close() error                       { return nil }
-func (c *sinkConn) LocalAddr() net.Addr                { return c.realFor.LocalAddr() }
-func (c *sinkConn) RemoteAddr() net.Addr               { return c.realFor.RemoteAddr() }
-func (c *sinkConn) SetDeadline(time.Time) error        { return nil }
-func (c *sinkConn) SetReadDeadline(time.Time) error    { return nil }
-func (c *sinkConn) SetWriteDeadline(time.Time) error   { return nil }
 
 // readHandshakeBytes reads the initial client-hello burst from conn.
 //
@@ -507,6 +475,10 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	// client-hello → write server-hello (discarded) → return.
 	// It does NOT read the session/OpenTCP message, so it completes entirely
 	// within the already-buffered bytes.
+	// Phase 2 uses sudokuapis.ProbeHandshake — a pure in-memory function that
+	// calls the library's internal probeHandshakeBytes directly.  It uses
+	// bytes.NewReader, starts no goroutines, and has no side effects on any
+	// connection.  This eliminates all goroutine-leak / lock-contention issues.
 	matchedIndex := -1
 	for i, user := range users {
 		probeCfg := user.cfg
@@ -516,11 +488,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			probeCfg = &inner
 		}
 
-		probe := newSinkConn(handshakeBytes, rawConn)
-		result, probeErr := sudokuapis.ServerHandshakeCore(probe, probeCfg)
-		if result != nil {
-			_ = result.Conn.Close() // release any internal state
-		}
+		probeErr := sudokuapis.ProbeHandshake(handshakeBytes, probeCfg)
 
 		fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
 			map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
