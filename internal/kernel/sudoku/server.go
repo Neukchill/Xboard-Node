@@ -1,6 +1,7 @@
 package sudoku
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -18,43 +19,72 @@ import (
 	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
 
-// replayableConn wraps a net.Conn and records every byte obtained from the
-// underlying connection.  Calling Reset() rewinds the internal read cursor
-// to zero so that subsequent Read calls replay the recorded bytes before
-// continuing to read from the underlying conn.
+// sinkConn is used exclusively for per-user probe attempts in handleConn.
 //
-// This is used in handleConn to allow multiple sequential Sudoku handshake
-// probes (one per registered user) to each see the same incoming byte stream
-// without having to re-establish the connection or chain PreBufferedConns.
-type replayableConn struct {
-	net.Conn
-	buf []byte // bytes recorded from underlying Conn
-	pos int    // current read position within buf
+// Reads come from an in-memory bytes.Reader so they are always instantaneous
+// and never block or interact with the real network connection.  Writes are
+// silently discarded so the library's "write server hello" step does not
+// fail during probing.  Deadline methods are no-ops so a probe cannot
+// disturb the real connection's read deadline.
+//
+// Because every byte is served from an already-complete in-memory snapshot,
+// any goroutine spawned internally by crypto.NewRecordConn will immediately
+// receive io.EOF when it tries to read beyond the available bytes and will
+// exit on its own — eliminating the goroutine-leak / lock-contention problem
+// that broke the previous replayableConn approach.
+type sinkConn struct {
+	reader  *bytes.Reader
+	realFor net.Conn // used only for LocalAddr / RemoteAddr
 }
 
-func newReplayableConn(c net.Conn) *replayableConn {
-	return &replayableConn{Conn: c}
+func newSinkConn(data []byte, realFor net.Conn) *sinkConn {
+	return &sinkConn{reader: bytes.NewReader(data), realFor: realFor}
 }
 
-// Reset rewinds the read cursor to the beginning of the recorded buffer.
-// The next Read will replay from byte 0.
-func (r *replayableConn) Reset() { r.pos = 0 }
+func (c *sinkConn) Read(p []byte) (int, error)         { return c.reader.Read(p) }
+func (c *sinkConn) Write(p []byte) (int, error)        { return len(p), nil } // discard
+func (c *sinkConn) Close() error                       { return nil }
+func (c *sinkConn) LocalAddr() net.Addr                { return c.realFor.LocalAddr() }
+func (c *sinkConn) RemoteAddr() net.Addr               { return c.realFor.RemoteAddr() }
+func (c *sinkConn) SetDeadline(time.Time) error        { return nil }
+func (c *sinkConn) SetReadDeadline(time.Time) error    { return nil }
+func (c *sinkConn) SetWriteDeadline(time.Time) error   { return nil }
 
-// Read satisfies io.Reader.  It serves bytes from the replay buffer first;
-// once the buffer is exhausted it reads fresh bytes from the underlying
-// Conn, appending them to the buffer so they can be replayed later.
-func (r *replayableConn) Read(p []byte) (int, error) {
-	if r.pos < len(r.buf) {
-		n := copy(p, r.buf[r.pos:])
-		r.pos += n
-		return n, nil
+// readHandshakeBytes reads the initial client-hello burst from conn.
+//
+// The caller must have already set a read deadline on rawConn (the underlying
+// TCP/TLS connection).  readHandshakeBytes blocks until the first chunk of
+// data arrives, then uses a 20 ms short-deadline loop to drain any additional
+// bytes that arrived in the same burst.  Because the sudoku client sends the
+// entire client hello before waiting for the server hello, all handshake bytes
+// arrive in a single burst and this function captures them completely.
+func readHandshakeBytes(conn net.Conn, rawConn net.Conn) ([]byte, error) {
+	tmp := make([]byte, 4096)
+
+	// First read: waits up to the caller-set deadline for data.
+	n, err := conn.Read(tmp)
+	if n == 0 {
+		return nil, err
 	}
-	n, err := r.Conn.Read(p)
-	if n > 0 {
-		r.buf = append(r.buf, p[:n]...)
-		r.pos += n
+	buf := make([]byte, n, n+4096)
+	copy(buf, tmp[:n])
+	if err != nil {
+		// EOF / deadline on first read with data is fine.
+		return buf, nil
 	}
-	return n, err
+
+	// Short-deadline reads to capture any additional buffered bytes.
+	for len(buf) < 32*1024 {
+		rawConn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		n, err = conn.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break // deadline exceeded or connection gone — we have enough
+		}
+	}
+	return buf, nil
 }
 
 // NodeSettings holds node-level (shared across all users) configuration.
@@ -188,19 +218,11 @@ func NewServer(settings NodeSettings, log *slog.Logger) *Server {
 
 // Start binds the listener and begins accepting connections.
 func (s *Server) Start() error {
-	// Initialize the HTTPMask tunnel server for non-legacy modes.
-	// This handles the outer WebSocket / HTTP-tunnel upgrade before the
-	// per-user Sudoku obfs handshake runs on the inner stream.
 	switch strings.ToLower(strings.TrimSpace(s.settings.HTTPMaskMode)) {
 	case "ws", "stream", "poll", "auto":
 		s.httpmaskServer = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
-			Mode:     s.settings.HTTPMaskMode,
-			PathRoot: s.settings.HTTPMaskPathRoot,
-			// AuthKey + EarlyHandshake are intentionally not set:
-			//   - AuthKey is single-key anti-probing; multi-user nodes
-			//     authenticate at the inner Sudoku layer instead.
-			//   - EarlyHandshake binds to one user's PSK/Table; not usable
-			//     for multi-user probing. The extra RTT is acceptable.
+			Mode:                s.settings.HTTPMaskMode,
+			PathRoot:            s.settings.HTTPMaskPathRoot,
 			PassThroughOnReject: true,
 		})
 	}
@@ -242,7 +264,6 @@ func (s *Server) Stop() {
 // UpdateUsers atomically replaces the full user list.
 // Returns (added, removed) counts.
 func (s *Server) UpdateUsers(entries []userEntry) (added, removed int) {
-	// Populate derived key + config for each entry
 	filled := make([]userEntry, 0, len(entries))
 	for _, e := range entries {
 		e.key = deriveKey(e.uuid, e.salt)
@@ -408,10 +429,18 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// handleConn authenticates an incoming connection by sequentially trying each
-// registered user's ProtocolConfig. On each failure, the HandshakeError carry
-// the bytes already consumed, which are prepended to the raw connection for the
-// next attempt (replay mechanism from the official API).
+// handleConn authenticates an incoming connection using a two-phase approach:
+//
+// Phase 1 — buffer: read all client-hello bytes into memory in one burst.
+//
+// Phase 2 — identify: for each registered user, run ServerHandshakeCore
+// against a sinkConn (reads from bytes.Reader, writes to /dev/null).
+// This is completely stateless — every probe sees an independent copy of the
+// bytes, there are no goroutine leaks between probes, and no lock contention.
+//
+// Phase 3 — handshake: replay the buffered bytes via NewPreBufferedConn and
+// run the full ServerHandshakeSessionAutoWithUserHash on the real connection
+// for the matched user only.
 func (s *Server) handleConn(rawConn net.Conn) {
 	defer rawConn.Close()
 
@@ -426,12 +455,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		return
 	}
 
-	// Determine the connection that will be handed to the inner Sudoku probe loop,
-	// and whether the inner handshake should skip the HTTP-header peek.
-	//
-	// For ws / stream / poll / auto modes, the outer HTTPMask tunnel layer
-	// (WebSocket Upgrade or HTTP tunnel framing) is processed first. Only after
-	// that upgrade succeeds does the inner Sudoku obfs handshake run.
+	// Outer HTTPMask upgrade (ws / stream / poll / auto modes).
 	var current net.Conn = rawConn
 	disableInnerHTTPMask := false
 
@@ -443,39 +467,48 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 		switch res {
 		case httpmask.HandleDone:
-			// Tunnel server already handled and closed the connection
-			// (e.g. poll control request, rejected probe).
 			return
 		case httpmask.HandleStartTunnel:
-			// WS / stream upgrade succeeded. The returned conn carries the
-			// raw Sudoku stream. The inner handshake must skip its own
-			// HTTP-header peek because the bytes are already past that point.
 			current = c
 			disableInnerHTTPMask = true
 		case httpmask.HandlePassThrough:
-			// Not an HTTP tunnel request (or rejected with PassThroughOnReject).
-			// The returned conn replays any pre-read bytes; fall through to
-			// the legacy probe loop on it.
 			current = c
 		default:
 			return
 		}
 	}
 
-	// Wrap the logical stream in a replayableConn so every user probe reads
-	// from exactly the same byte sequence.  replayableConn records every
-	// byte obtained from the underlying connection; Reset() rewinds the read
-	// cursor to zero so the next probe re-reads the identical bytes without
-	// touching the underlying conn again.
-	//
-	// This replaces the old HandshakeError-based PreBufferedConn chain, which
-	// broke in WS/tunnel mode because hsErr.RawConn referred to the raw TCP
-	// layer rather than the decoded inner stream.
-	replay := newReplayableConn(current)
+	// ── Phase 1: buffer ──────────────────────────────────────────────────────
+	// Set the handshake deadline on the raw conn so it propagates through any
+	// WS/stream wrapper to the underlying TCP read.
+	timeout := s.settings.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = 10
+	}
+	rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 
+	handshakeBytes, err := readHandshakeBytes(current, rawConn)
+
+	// Restore deadline regardless of outcome; Phase 3 will set its own.
+	rawConn.SetReadDeadline(time.Time{})
+
+	if err != nil && len(handshakeBytes) == 0 {
+		s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", err)
+		return
+	}
+	if len(handshakeBytes) == 0 {
+		s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
+		return
+	}
+
+	// ── Phase 2: identify ────────────────────────────────────────────────────
+	// Try each user's config against an in-memory sinkConn.
+	// ServerHandshakeCore does: HTTP-mask peek → table probe → AEAD decrypt
+	// client-hello → write server-hello (discarded) → return.
+	// It does NOT read the session/OpenTCP message, so it completes entirely
+	// within the already-buffered bytes.
+	matchedIndex := -1
 	for i, user := range users {
-		replay.Reset()
-
 		probeCfg := user.cfg
 		if disableInnerHTTPMask {
 			inner := *user.cfg
@@ -483,29 +516,57 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			probeCfg = &inner
 		}
 
-		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(replay, probeCfg)
-		if err == nil {
-			fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d\n", i, user.id, len(replay.buf))
-			s.proxy(conn, session, targetAddr, user)
-			return
+		probe := newSinkConn(handshakeBytes, rawConn)
+		result, probeErr := sudokuapis.ServerHandshakeCore(probe, probeCfg)
+		if result != nil {
+			_ = result.Conn.Close() // release any internal state
 		}
 
-		fmt.Printf("[sudoku-debug] PROBE FAIL index=%d user_id=%d buf=%d err=%v\n", i, user.id, len(replay.buf), err)
+		fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
+			map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
+			i, user.id, len(handshakeBytes), probeErr)
 
-		if len(replay.buf) == 0 {
-			fmt.Printf("[sudoku-debug] DEAD conn\n")
-			return
+		if probeErr == nil {
+			matchedIndex = i
+			break
 		}
 	}
 
-	s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
+	if matchedIndex < 0 {
+		s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
+		return
+	}
+
+	// ── Phase 3: real handshake ───────────────────────────────────────────────
+	// Replay the buffered bytes on top of the real connection and run the full
+	// handshake + session-message read for the matched user.
+	matchedUser := users[matchedIndex]
+	realCfg := matchedUser.cfg
+	if disableInnerHTTPMask {
+		inner := *matchedUser.cfg
+		inner.DisableHTTPMask = true
+		realCfg = &inner
+	}
+
+	// NewPreBufferedConn serves handshakeBytes first, then reads from current.
+	// The library re-reads the client hello from the buffer, sends the real
+	// server hello over current, then reads the OpenTCP/UoT message from the
+	// live connection — exactly the correct sequence.
+	preBuffered := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
+	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(preBuffered, realCfg)
+	if err != nil {
+		s.log.Debug("real handshake failed after probe match",
+			"user_id", matchedUser.id, "err", err)
+		return
+	}
+
+	s.proxy(conn, session, targetAddr, matchedUser)
 }
 
 // proxy relays traffic between the authenticated tunnel connection and the target.
 func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr string, user userEntry) {
 	connID := conn.RemoteAddr().String()
 
-	// Register live connection.
 	s.connsMu.Lock()
 	s.conns[connID] = &connRecord{userID: user.id, uuid: user.uuid, client: conn}
 	s.connsMu.Unlock()
@@ -522,15 +583,11 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 
 	switch session {
 	case sudokuapis.SessionUoT:
-		// UDP-over-TCP: the Sudoku library handles framing internally.
-		// We can't easily count per-packet bytes here; traffic will not be
-		// attributed for UoT sessions in this version.
 		if err := sudokuapis.HandleUoT(conn); err != nil {
 			s.log.Debug("UoT session ended", "uuid", user.uuid, "err", err)
 		}
 
 	case sudokuapis.SessionMux:
-		// Multiplexed session: use HandleMuxWithDialer to proxy sub-streams.
 		err := sudokuapis.HandleMuxWithDialer(conn,
 			func(addr string) { s.log.Debug("mux sub-stream", "uuid", user.uuid, "target", addr) },
 			func(addr string) (net.Conn, error) {
@@ -538,7 +595,6 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 				if err != nil {
 					return nil, err
 				}
-				// Count traffic for each sub-connection.
 				return &countingConn{Conn: target, userID: user.id, srv: s}, nil
 			},
 		)
@@ -547,7 +603,6 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 		}
 
 	default: // SessionForward
-		// Standard TCP relay.
 		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
 			s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
