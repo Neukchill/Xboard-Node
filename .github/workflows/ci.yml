@@ -21,6 +21,16 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
+      - name: Debug module state
+        run: |
+          echo "=== probe.go ==="
+          cat sudoku-patched/apis/probe.go || echo "NOT FOUND"
+          echo "=== go.mod replace ==="
+          grep -A1 "SUDOKU\|sudoku-patched" go.mod || echo "NOT FOUND"
+          echo "=== go build apis ==="
+          go build github.com/SUDOKU-ASCII/sudoku/apis && echo "OK" || echo "FAIL"
+          echo "=== go version ==="
+          go version
       - name: Run tests
         run: make test
 
