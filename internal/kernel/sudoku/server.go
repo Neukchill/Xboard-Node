@@ -424,9 +424,20 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 	}
 
-	// current is the "replay-capable" connection we pass to each attempt.
-	// After each handshake failure, it is rebuilt from the HandshakeError's
-	// replay bytes + remaining raw conn so the next user can retry.
+	// streamConn is the logical stream we probe against.
+	// In WS/tunnel mode this is the decoded inner stream (post-upgrade);
+	// in legacy mode it is rawConn (or the PassThrough pre-buffered conn).
+	// We pin it here so the replay loop always anchors to the same base
+	// connection and never chains PreBufferedConns on top of each other,
+	// which would cause WS framing bytes to leak into later probes.
+	streamConn := current
+
+	// accReplay accumulates every byte that has been consumed from streamConn
+	// across all probe attempts so far.  Each probe's ReadData contains the
+	// entire prefix it needed to read (replayed bytes + any fresh bytes), so
+	// we grow accReplay by keeping the longest ReadData seen.
+	var accReplay []byte
+
 	for _, user := range users {
 		// When the outer WS/stream/poll layer already consumed the HTTP
 		// part, clone the per-user cfg with DisableHTTPMask=true so that
@@ -454,12 +465,24 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			return
 		}
 
-		// Rebuild the connection for the next user attempt by replaying
-		// the bytes already consumed: HTTPHeaderData + ReadData.
-		replayBytes := make([]byte, 0, len(hsErr.HTTPHeaderData)+len(hsErr.ReadData))
-		replayBytes = append(replayBytes, hsErr.HTTPHeaderData...)
-		replayBytes = append(replayBytes, hsErr.ReadData...)
-		current = sudokuapis.NewPreBufferedConn(hsErr.RawConn, replayBytes)
+		// Collect bytes consumed by this probe attempt.
+		thisBytes := make([]byte, 0, len(hsErr.HTTPHeaderData)+len(hsErr.ReadData))
+		thisBytes = append(thisBytes, hsErr.HTTPHeaderData...)
+		thisBytes = append(thisBytes, hsErr.ReadData...)
+
+		// Grow the accumulated replay buffer if this probe consumed more data
+		// than previous ones (it re-read the whole prefix from the buffer, so
+		// ReadData.len >= accReplay.len when more fresh bytes were consumed).
+		if len(thisBytes) > len(accReplay) {
+			accReplay = thisBytes
+		}
+
+		// Rebuild current by replaying ALL accumulated bytes from the original
+		// streamConn.  This avoids chaining PreBufferedConns and ensures every
+		// subsequent probe starts from a clean, consistent view of the stream.
+		replayCopy := make([]byte, len(accReplay))
+		copy(replayCopy, accReplay)
+		current = sudokuapis.NewPreBufferedConn(streamConn, replayCopy)
 	}
 
 	s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
