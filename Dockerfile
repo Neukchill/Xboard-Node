@@ -6,6 +6,7 @@ RUN apk add --no-cache git
 WORKDIR /build
 
 COPY go.mod go.sum ./
+COPY sudoku-patched/ ./sudoku-patched/
 RUN go mod download
 
 COPY . .

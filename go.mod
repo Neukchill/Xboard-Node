@@ -180,3 +180,4 @@ require (
 replace github.com/sagernet/sing-box => github.com/cedar2025/sing-box v1.14.0-alpha.2.0.20260316103356-2e665cb7e295
 
 replace github.com/xtls/xray-core => github.com/cedar2025/Xray-core v0.0.0-20260409213332-f47935539965
+replace github.com/SUDOKU-ASCII/sudoku v0.4.3 => ./sudoku-patched
