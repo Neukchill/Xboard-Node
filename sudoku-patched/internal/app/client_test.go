@@ -1,0 +1,472 @@
+/*
+Copyright (C) 2026 by saba <contact me via issue>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+In addition, no derivative work may use the name or imply association
+with this application without prior consent.
+*/
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/SUDOKU-ASCII/sudoku/internal/config"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/dnsutil"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/geodata"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
+)
+
+func newRuleManagerForTest(t *testing.T, payload string) *geodata.Manager {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/yaml")
+		_, _ = w.Write([]byte(payload))
+	}))
+	t.Cleanup(srv.Close)
+
+	mgr := geodata.NewManager([]string{srv.URL})
+	mgr.Update()
+	return mgr
+}
+
+// MockConn implements net.Conn for testing
+type MockConn struct {
+	ReadBuf  *bytes.Buffer
+	WriteBuf *bytes.Buffer
+	Closed   bool
+}
+
+func NewMockConn(data []byte) *MockConn {
+	return &MockConn{
+		ReadBuf:  bytes.NewBuffer(data),
+		WriteBuf: new(bytes.Buffer),
+	}
+}
+
+func (m *MockConn) Read(b []byte) (n int, err error) {
+	return m.ReadBuf.Read(b)
+}
+
+func (m *MockConn) Write(b []byte) (n int, err error) {
+	return m.WriteBuf.Write(b)
+}
+
+func (m *MockConn) Close() error {
+	m.Closed = true
+	return nil
+}
+
+func (m *MockConn) LocalAddr() net.Addr                { return nil }
+func (m *MockConn) RemoteAddr() net.Addr               { return nil }
+func (m *MockConn) SetDeadline(t time.Time) error      { return nil }
+func (m *MockConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *MockConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// MockDialer implements tunnel.Dialer
+type MockDialer struct {
+	DialFunc func(destAddrStr string) (net.Conn, error)
+}
+
+func (m *MockDialer) Dial(destAddrStr string) (net.Conn, error) {
+	if m.DialFunc != nil {
+		return m.DialFunc(destAddrStr)
+	}
+	return NewMockConn(nil), nil
+}
+
+func TestDialTarget_PACUnmatchedHostProxiesWithoutLocalDNS(t *testing.T) {
+	geoMgr := newRuleManagerForTest(t, "payload:\n  - '1.2.3.0/24'\n")
+
+	oldDirectDial := directDial
+	oldResolveWithCache := resolveWithCache
+	t.Cleanup(func() {
+		directDial = oldDirectDial
+		resolveWithCache = oldResolveWithCache
+	})
+
+	directDial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		t.Fatalf("unexpected direct dial: %s", addr)
+		return nil, nil
+	}
+	resolveWithCache = func(ctx context.Context, resolver *dnsutil.Resolver, addr string) (string, error) {
+		t.Fatalf("unexpected local resolve for unmatched PAC host: %s", addr)
+		return "", nil
+	}
+
+	cfg := &config.Config{ProxyMode: "pac"}
+	var proxyTarget string
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			proxyTarget = destAddrStr
+			return NewMockConn(nil), nil
+		},
+	}
+
+	routeMgrs := &routeManagers{direct: geoMgr}
+	_, _, ok := dialTarget("TCP", nil, "foo.example:443", nil, cfg, routeMgrs, dialer, nil)
+	if !ok {
+		t.Fatalf("expected proxy dial success")
+	}
+	if proxyTarget != "foo.example:443" {
+		t.Fatalf("unexpected proxy target: %q", proxyTarget)
+	}
+}
+
+func TestDialTarget_PACDirectDomainStillResolvesForDirectDial(t *testing.T) {
+	geoMgr := newRuleManagerForTest(t, "payload:\n  - DOMAIN-SUFFIX,example.cn\n")
+
+	oldDirectDial := directDial
+	oldResolveWithCache := resolveWithCache
+	t.Cleanup(func() {
+		directDial = oldDirectDial
+		resolveWithCache = oldResolveWithCache
+	})
+
+	resolveWithCache = func(ctx context.Context, resolver *dnsutil.Resolver, addr string) (string, error) {
+		if addr != "foo.example.cn:443" {
+			t.Fatalf("unexpected resolve target: %s", addr)
+		}
+		return "1.2.3.4:443", nil
+	}
+
+	var dialed string
+	directDial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		dialed = addr
+		return NewMockConn(nil), nil
+	}
+
+	cfg := &config.Config{ProxyMode: "pac"}
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			t.Fatalf("unexpected proxy dial: %s", destAddrStr)
+			return nil, nil
+		},
+	}
+
+	routeMgrs := &routeManagers{direct: geoMgr}
+	_, _, ok := dialTarget("TCP", nil, "foo.example.cn:443", nil, cfg, routeMgrs, dialer, nil)
+	if !ok {
+		t.Fatalf("expected direct dial success")
+	}
+	if dialed != "1.2.3.4:443" {
+		t.Fatalf("unexpected direct addr: %q", dialed)
+	}
+}
+
+func TestDialTarget_RejectSkipsOutboundDial(t *testing.T) {
+	rejectMgr := newRuleManagerForTest(t, "payload:\n  - DOMAIN-SUFFIX,ads.example\n")
+
+	oldDirectDial := directDial
+	t.Cleanup(func() {
+		directDial = oldDirectDial
+	})
+	directDial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		t.Fatalf("unexpected direct dial: %s", addr)
+		return nil, nil
+	}
+
+	cfg := &config.Config{ProxyMode: "global"}
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			t.Fatalf("unexpected proxy dial: %s", destAddrStr)
+			return nil, nil
+		},
+	}
+
+	conn, decision, ok := dialTarget("TCP", nil, "track.ads.example:443", nil, cfg, &routeManagers{reject: rejectMgr}, dialer, nil)
+	if ok {
+		t.Fatalf("expected reject route")
+	}
+	if conn != nil {
+		t.Fatalf("reject should not return a connection")
+	}
+	if decision.action != routeActionReject {
+		t.Fatalf("unexpected action: %s", decision.action)
+	}
+}
+
+func TestHandleMixedConn_HTTPRejectReturnsForbidden(t *testing.T) {
+	rejectMgr := newRuleManagerForTest(t, "payload:\n  - DOMAIN-SUFFIX,ads.example\n")
+
+	reqStr := "CONNECT track.ads.example:443 HTTP/1.1\r\nHost: track.ads.example:443\r\n\r\n"
+	conn := NewMockConn([]byte(reqStr))
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	handleMixedConn(conn, cfg, table, &routeManagers{reject: rejectMgr}, &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			t.Fatalf("unexpected proxy dial: %s", destAddrStr)
+			return nil, nil
+		},
+	}, nil)
+
+	if got := conn.WriteBuf.String(); got != "HTTP/1.1 403 Forbidden\r\n\r\n" {
+		t.Fatalf("unexpected HTTP reject response: %q", got)
+	}
+}
+
+func TestHandleMixedConn_SOCKS5RejectReturnsRulesetDeny(t *testing.T) {
+	rejectMgr := newRuleManagerForTest(t, "payload:\n  - DOMAIN-SUFFIX,ads.example\n")
+
+	input := []byte{
+		0x05, 0x01, 0x00,
+		0x05, 0x01, 0x00, 0x03, 0x11,
+		't', 'r', 'a', 'c', 'k', '.', 'a', 'd', 's', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+		0x01, 0xbb,
+	}
+	conn := NewMockConn(input)
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	handleMixedConn(conn, cfg, table, &routeManagers{reject: rejectMgr}, &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			t.Fatalf("unexpected proxy dial: %s", destAddrStr)
+			return nil, nil
+		},
+	}, nil)
+
+	resp := conn.WriteBuf.Bytes()
+	if len(resp) < 12 {
+		t.Fatalf("short SOCKS5 response: %v", resp)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		t.Fatalf("unexpected SOCKS5 method selection: %v", resp[:2])
+	}
+	if resp[3] != 0x02 {
+		t.Fatalf("expected ruleset deny reply, got %v", resp[2:12])
+	}
+}
+
+func TestHandleMixedConn_SOCKS4(t *testing.T) {
+	// Construct SOCKS4 Connect Request
+	// VN(4) | CD(1) | PORT(80) | IP(1.2.3.4) | USERID("user") | NULL
+	buf := new(bytes.Buffer)
+	buf.WriteByte(0x04)
+	buf.WriteByte(0x01)
+	binary.Write(buf, binary.BigEndian, uint16(80))
+	buf.Write([]byte{1, 2, 3, 4})
+	buf.WriteString("user")
+	buf.WriteByte(0x00)
+
+	conn := NewMockConn(buf.Bytes())
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	// Mock Dialer to capture target
+	var target string
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			target = destAddrStr
+			return NewMockConn(nil), nil
+		},
+	}
+
+	handleMixedConn(conn, cfg, table, nil, dialer, nil)
+
+	// Verify Target
+	expectedTarget := "1.2.3.4:80"
+	if target != expectedTarget {
+		t.Errorf("SOCKS4 target mismatch: got %q, want %q", target, expectedTarget)
+	}
+
+	// Verify Response (90 = Granted)
+	// VN(0) | CD(90) | ...
+	resp := conn.WriteBuf.Bytes()
+	if len(resp) < 2 || resp[1] != 0x5A {
+		t.Errorf("SOCKS4 response invalid: %v", resp)
+	}
+}
+
+func TestHandleMixedConn_SOCKS5(t *testing.T) {
+	// 1. Handshake: VER(5) | NMETHODS(1) | METHOD(0)
+	// 2. Request: VER(5) | CMD(1) | RSV(0) | ATYP(1) | IP(1.2.3.4) | PORT(80)
+	input := []byte{
+		0x05, 0x01, 0x00,
+		0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 80,
+	}
+	conn := NewMockConn(input)
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	var target string
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			target = destAddrStr
+			return NewMockConn(nil), nil
+		},
+	}
+
+	handleMixedConn(conn, cfg, table, nil, dialer, nil)
+
+	expectedTarget := "1.2.3.4:80"
+	if target != expectedTarget {
+		t.Errorf("SOCKS5 target mismatch: got %q, want %q", target, expectedTarget)
+	}
+}
+
+func TestHandleMixedConn_HTTP(t *testing.T) {
+	reqStr := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+	conn := NewMockConn([]byte(reqStr))
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	var target string
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			target = destAddrStr
+			return NewMockConn(nil), nil
+		},
+	}
+
+	handleMixedConn(conn, cfg, table, nil, dialer, nil)
+
+	expectedTarget := "example.com:443"
+	if target != expectedTarget {
+		t.Errorf("HTTP target mismatch: got %q, want %q", target, expectedTarget)
+	}
+}
+
+func TestHandleMixedConn_HTTPIPv6HostNoPort(t *testing.T) {
+	reqStr := "CONNECT [2001:db8::1] HTTP/1.1\r\nHost: [2001:db8::1]\r\n\r\n"
+	conn := NewMockConn([]byte(reqStr))
+	cfg := &config.Config{ProxyMode: "global"}
+	table := sudoku.NewTable("key", "prefer_entropy")
+
+	var target string
+	dialer := &MockDialer{
+		DialFunc: func(destAddrStr string) (net.Conn, error) {
+			target = destAddrStr
+			return NewMockConn(nil), nil
+		},
+	}
+
+	handleMixedConn(conn, cfg, table, nil, dialer, nil)
+
+	expectedTarget := "[2001:db8::1]:443"
+	if target != expectedTarget {
+		t.Errorf("HTTP IPv6 target mismatch: got %q, want %q", target, expectedTarget)
+	}
+}
+
+func TestSelectUDPAssociateReplyIP_LoopbackPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		localIP  net.IP
+		remoteIP net.IP
+		want     string
+	}{
+		{
+			name:     "drops loopback for loopback peers",
+			localIP:  net.ParseIP("127.0.0.1"),
+			remoteIP: net.ParseIP("127.0.0.1"),
+			want:     "",
+		},
+		{
+			name:     "drops loopback for non-loopback peers",
+			localIP:  net.ParseIP("127.0.0.1"),
+			remoteIP: net.ParseIP("172.19.0.2"),
+			want:     "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectUDPAssociateReplyIP(tc.localIP, tc.remoteIP)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("expected nil reply ip, got %v", got)
+				}
+				return
+			}
+			if got == nil || got.String() != tc.want {
+				t.Fatalf("unexpected reply ip: got %v want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInitialUDPAssociateClientIP(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   net.IP
+		want string
+	}{
+		{name: "nil stays nil", ip: nil, want: ""},
+		{name: "loopback becomes nil", ip: net.ParseIP("127.0.0.1"), want: ""},
+		{name: "private ipv4 is kept", ip: net.ParseIP("172.19.0.2"), want: "172.19.0.2"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := initialUDPAssociateClientIP(tc.ip)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("expected nil, got %v", got)
+				}
+				return
+			}
+			if got == nil || got.String() != tc.want {
+				t.Fatalf("unexpected client ip: got %v want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSelectUDPAssociateAdvertiseIP_UsesNonLoopbackFallback(t *testing.T) {
+	oldNetworkInterfaces := networkInterfaces
+	oldInterfaceAddrs := interfaceAddrs
+	networkInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Index: 1, Flags: net.FlagUp | net.FlagLoopback},
+			{Index: 2, Flags: net.FlagUp | net.FlagPointToPoint},
+			{Index: 3, Flags: net.FlagUp | net.FlagBroadcast},
+		}, nil
+	}
+	interfaceAddrs = func(iface net.Interface) ([]net.Addr, error) {
+		switch iface.Index {
+		case 1:
+			return []net.Addr{
+				&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+			}, nil
+		case 2:
+			return []net.Addr{
+				&net.IPNet{IP: net.ParseIP("172.19.0.2"), Mask: net.CIDRMask(16, 32)},
+			}, nil
+		case 3:
+			return []net.Addr{
+				&net.IPNet{IP: net.ParseIP("10.0.0.148"), Mask: net.CIDRMask(24, 32)},
+			}, nil
+		default:
+			return nil, nil
+		}
+	}
+	t.Cleanup(func() {
+		networkInterfaces = oldNetworkInterfaces
+		interfaceAddrs = oldInterfaceAddrs
+	})
+
+	got := selectUDPAssociateAdvertiseIP(net.ParseIP("127.0.0.1"), net.ParseIP("127.0.0.1"))
+	if got == nil || got.String() != "10.0.0.148" {
+		t.Fatalf("unexpected advertise ip: got %v want 10.0.0.148", got)
+	}
+}
