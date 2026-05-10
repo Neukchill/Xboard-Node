@@ -474,13 +474,8 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	replay := newReplayableConn(current)
 
 	for i, user := range users {
-		// Rewind so this probe sees the same bytes as every previous probe.
 		replay.Reset()
 
-		// When the outer WS/stream/poll layer already consumed the HTTP
-		// part, clone the per-user cfg with DisableHTTPMask=true so that
-		// the inner handshake doesn't try to peek for HTTP again on the
-		// upgraded stream.
 		probeCfg := user.cfg
 		if disableInnerHTTPMask {
 			inner := *user.cfg
@@ -490,18 +485,15 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(replay, probeCfg)
 		if err == nil {
-			s.log.Info("sudoku probe SUCCESS", "probe_index", i, "user_id", user.id, "buf_bytes", len(replay.buf))
-			// Authenticated! Start proxying.
+			fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d\n", i, user.id, len(replay.buf))
 			s.proxy(conn, session, targetAddr, user)
 			return
 		}
 
-		s.log.Info("sudoku probe FAIL", "probe_index", i, "user_id", user.id, "buf_bytes", len(replay.buf), "err", err)
+		fmt.Printf("[sudoku-debug] PROBE FAIL index=%d user_id=%d buf=%d err=%v\n", i, user.id, len(replay.buf), err)
 
-		// If no bytes were buffered at all the underlying connection is
-		// already dead; there is nothing to replay.
 		if len(replay.buf) == 0 {
-			s.log.Info("connection dead before handshake data", "remote", rawConn.RemoteAddr())
+			fmt.Printf("[sudoku-debug] DEAD conn\n")
 			return
 		}
 	}
