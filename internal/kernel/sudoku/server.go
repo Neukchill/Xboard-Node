@@ -473,7 +473,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	// layer rather than the decoded inner stream.
 	replay := newReplayableConn(current)
 
-	for _, user := range users {
+	for i, user := range users {
 		// Rewind so this probe sees the same bytes as every previous probe.
 		replay.Reset()
 
@@ -490,16 +490,18 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(replay, probeCfg)
 		if err == nil {
+			s.log.Info("sudoku probe SUCCESS", "probe_index", i, "user_id", user.id, "buf_bytes", len(replay.buf))
 			// Authenticated! Start proxying.
 			s.proxy(conn, session, targetAddr, user)
 			return
 		}
 
+		s.log.Info("sudoku probe FAIL", "probe_index", i, "user_id", user.id, "buf_bytes", len(replay.buf), "err", err)
+
 		// If no bytes were buffered at all the underlying connection is
 		// already dead; there is nothing to replay.
 		if len(replay.buf) == 0 {
-			s.log.Debug("connection closed before handshake data received",
-				"remote", rawConn.RemoteAddr())
+			s.log.Info("connection dead before handshake data", "remote", rawConn.RemoteAddr())
 			return
 		}
 	}
