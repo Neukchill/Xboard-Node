@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +17,45 @@ import (
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
+
+// replayableConn wraps a net.Conn and records every byte obtained from the
+// underlying connection.  Calling Reset() rewinds the internal read cursor
+// to zero so that subsequent Read calls replay the recorded bytes before
+// continuing to read from the underlying conn.
+//
+// This is used in handleConn to allow multiple sequential Sudoku handshake
+// probes (one per registered user) to each see the same incoming byte stream
+// without having to re-establish the connection or chain PreBufferedConns.
+type replayableConn struct {
+	net.Conn
+	buf []byte // bytes recorded from underlying Conn
+	pos int    // current read position within buf
+}
+
+func newReplayableConn(c net.Conn) *replayableConn {
+	return &replayableConn{Conn: c}
+}
+
+// Reset rewinds the read cursor to the beginning of the recorded buffer.
+// The next Read will replay from byte 0.
+func (r *replayableConn) Reset() { r.pos = 0 }
+
+// Read satisfies io.Reader.  It serves bytes from the replay buffer first;
+// once the buffer is exhausted it reads fresh bytes from the underlying
+// Conn, appending them to the buffer so they can be replayed later.
+func (r *replayableConn) Read(p []byte) (int, error) {
+	if r.pos < len(r.buf) {
+		n := copy(p, r.buf[r.pos:])
+		r.pos += n
+		return n, nil
+	}
+	n, err := r.Conn.Read(p)
+	if n > 0 {
+		r.buf = append(r.buf, p[:n]...)
+		r.pos += n
+	}
+	return n, err
+}
 
 // NodeSettings holds node-level (shared across all users) configuration.
 type NodeSettings struct {
@@ -424,21 +462,21 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 	}
 
-	// streamConn is the logical stream we probe against.
-	// In WS/tunnel mode this is the decoded inner stream (post-upgrade);
-	// in legacy mode it is rawConn (or the PassThrough pre-buffered conn).
-	// We pin it here so the replay loop always anchors to the same base
-	// connection and never chains PreBufferedConns on top of each other,
-	// which would cause WS framing bytes to leak into later probes.
-	streamConn := current
-
-	// accReplay accumulates every byte that has been consumed from streamConn
-	// across all probe attempts so far.  Each probe's ReadData contains the
-	// entire prefix it needed to read (replayed bytes + any fresh bytes), so
-	// we grow accReplay by keeping the longest ReadData seen.
-	var accReplay []byte
+	// Wrap the logical stream in a replayableConn so every user probe reads
+	// from exactly the same byte sequence.  replayableConn records every
+	// byte obtained from the underlying connection; Reset() rewinds the read
+	// cursor to zero so the next probe re-reads the identical bytes without
+	// touching the underlying conn again.
+	//
+	// This replaces the old HandshakeError-based PreBufferedConn chain, which
+	// broke in WS/tunnel mode because hsErr.RawConn referred to the raw TCP
+	// layer rather than the decoded inner stream.
+	replay := newReplayableConn(current)
 
 	for _, user := range users {
+		// Rewind so this probe sees the same bytes as every previous probe.
+		replay.Reset()
+
 		// When the outer WS/stream/poll layer already consumed the HTTP
 		// part, clone the per-user cfg with DisableHTTPMask=true so that
 		// the inner handshake doesn't try to peek for HTTP again on the
@@ -450,39 +488,20 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			probeCfg = &inner
 		}
 
-		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(current, probeCfg)
+		conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(replay, probeCfg)
 		if err == nil {
 			// Authenticated! Start proxying.
 			s.proxy(conn, session, targetAddr, user)
 			return
 		}
 
-		// Check if replay is possible.
-		var hsErr *sudokuapis.HandshakeError
-		if !errors.As(err, &hsErr) {
-			// Non-replay error (e.g. network closed) — give up.
-			s.log.Debug("non-replay handshake error", "remote", rawConn.RemoteAddr(), "err", err)
+		// If no bytes were buffered at all the underlying connection is
+		// already dead; there is nothing to replay.
+		if len(replay.buf) == 0 {
+			s.log.Debug("connection closed before handshake data received",
+				"remote", rawConn.RemoteAddr())
 			return
 		}
-
-		// Collect bytes consumed by this probe attempt.
-		thisBytes := make([]byte, 0, len(hsErr.HTTPHeaderData)+len(hsErr.ReadData))
-		thisBytes = append(thisBytes, hsErr.HTTPHeaderData...)
-		thisBytes = append(thisBytes, hsErr.ReadData...)
-
-		// Grow the accumulated replay buffer if this probe consumed more data
-		// than previous ones (it re-read the whole prefix from the buffer, so
-		// ReadData.len >= accReplay.len when more fresh bytes were consumed).
-		if len(thisBytes) > len(accReplay) {
-			accReplay = thisBytes
-		}
-
-		// Rebuild current by replaying ALL accumulated bytes from the original
-		// streamConn.  This avoids chaining PreBufferedConns and ensures every
-		// subsequent probe starts from a clean, consistent view of the stream.
-		replayCopy := make([]byte, len(accReplay))
-		copy(replayCopy, accReplay)
-		current = sudokuapis.NewPreBufferedConn(streamConn, replayCopy)
 	}
 
 	s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
