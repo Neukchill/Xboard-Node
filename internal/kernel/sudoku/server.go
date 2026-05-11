@@ -516,20 +516,30 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		realCfg = &inner
 	}
 
-	// NewPreBufferedConn serves handshakeBytes first, then reads from current.
-	// The library re-reads the client hello from the buffer, sends the real
-	// server hello over current, then reads the OpenTCP/UoT message from the
-	// live connection — exactly the correct sequence.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[sudoku-debug] PHASE3 PANIC user_id=%d r=%v\n", matchedUser.id, r)
+		}
+	}()
+	
+	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
+		matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
+
 	preBuffered := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
 	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(preBuffered, realCfg)
 	if err != nil {
-	    s.log.Info("real handshake failed after probe match",
-	        "user_id", matchedUser.id, "err", err)
+	    fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
+	        matchedUser.id, err)
 	    return
 	}
+
+	fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE OK user_id=%d session=%v target=%s\n",
+		matchedUser.id, session, targetAddr)
 	
-	s.log.Info("real handshake SUCCESS", "user_id", matchedUser.id, "session", session, "target", targetAddr)
 	s.proxy(conn, session, targetAddr, matchedUser)
+
+	fmt.Printf("[sudoku-debug] PHASE3 PROXY EXITED user_id=%d target=%s\n",
+		matchedUser.id, targetAddr)
 }
 
 // proxy relays traffic between the authenticated tunnel connection and the target.
@@ -574,9 +584,12 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 	default: // SessionForward
 		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
-			s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
-			return
+	        fmt.Printf("[sudoku-debug] DIAL TARGET FAIL target=%s user_id=%d err=%v\n",
+	            targetAddr, user.id, err)
+	        s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
+	        return
 		}
+		fmt.Printf("[sudoku-debug] DIAL TARGET OK target=%s user_id=%d\n", targetAddr, user.id)
 		defer target.Close()
 
 		up, dn := relay(conn, target)
