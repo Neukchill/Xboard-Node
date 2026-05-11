@@ -455,45 +455,55 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	var handshakeBytes []byte
 
 	if disableInnerHTTPMask {
-		// WS / stream tunnel mode.
-		//
-		// coder/websocket.NetConn treats ANY read error — including a transient
-		// "i/o timeout" — as a permanent connection failure: it sends a WebSocket
-		// Close frame and marks the conn as broken. Subsequent reads then return
-		// EOF immediately.
-		//
-		// The previous burst-drain approach called rawConn.SetReadDeadline(20ms)
-		// while reading through "current" (the WS conn). That 20 ms deadline fired
-		// on the underlying TCP layer mid-frame, permanently breaking the WS conn
-		// before Phase 3 could use it.
-		//
-		// Fix: use a SINGLE timed read on "current" itself. One Read() on a WS
-		// NetConn returns exactly one complete WS message (= the full Sudoku client
-		// hello). There is no second message to drain: the client waits for the
-		// server hello before sending OpenTCP. Provided this read succeeds (it always
-		// does when the client is actively connecting), the deadline never fires and
-		// the WS conn stays healthy for Phase 3.
-		tmp := make([]byte, 64*1024)
-		current.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-		n, readErr := current.Read(tmp)
-		current.SetReadDeadline(time.Time{})
-		if n == 0 {
-			fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/tunnel) remote=%s err=%v\n",
-				rawConn.RemoteAddr(), readErr)
-			return
+			// WS / stream tunnel mode.
+			//
+			// coder/websocket.NetConn.Read() 和普通 TCP 一样按 TCP 段返回，不等整条 WS 消息到齐。
+			// 客户端 hello 通常 500-600 字节，分多个 TCP 段，需要循环读直到 io.EOF（WS 消息结束）。
+			//
+			// 关键约束：绝对不能在 rawConn 上设短 deadline 再从 current(WS conn) 读——
+			// coder/websocket 把任何底层读错误视为永久连接失败，后续读全返回 EOF。
+			//
+			// 只在 current 上设置完整 handshake timeout 一次，然后循环读直到 io.EOF。
+			// 合法客户端 hello 在毫秒级到达，timeout 只对扫描器/攻击者触发。
+			// 当 timeout 触发时 WS conn 会被 coder/websocket 标记为 broken，
+			// 但此时我们本来就要 drop 这条连接（超时），所以没有问题。
+			current.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+			tmp := make([]byte, 4096)
+			for len(handshakeBytes) < 32*1024 {
+				n, readErr := current.Read(tmp)
+				if n > 0 {
+					handshakeBytes = append(handshakeBytes, tmp[:n]...)
+				}
+				if readErr != nil {
+					// io.EOF = WS 消息读完（正常，所有 client hello 字节已到位）
+					// 其他错误 = 连接异常
+					if readErr != io.EOF {
+						fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
+							rawConn.RemoteAddr(), readErr)
+					}
+					break
+				}
+			}
+			current.SetReadDeadline(time.Time{})
+			if len(handshakeBytes) == 0 {
+				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/empty) remote=%s\n",
+					rawConn.RemoteAddr())
+				return
+			}
+		} else {
+			// Plain TCP / TLS mode: burst-drain 对 raw TCP 是安全的。
+			rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+			var readErr error
+			handshakeBytes, readErr = readHandshakeBytes(current, rawConn)
+			rawConn.SetReadDeadline(time.Time{})
+			if readErr != nil && len(handshakeBytes) == 0 {
+				s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", readErr)
+				return
+			}
 		}
-		handshakeBytes = make([]byte, n)
-		copy(handshakeBytes, tmp[:n])
-	} else {
-		// Plain TCP / TLS mode.
-		// readHandshakeBytes uses short-deadline drain reads that are safe on a
-		// raw TCP conn (deadline errors don't permanently break TCP connections).
-		rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-		var readErr error
-		handshakeBytes, readErr = readHandshakeBytes(current, rawConn)
-		rawConn.SetReadDeadline(time.Time{})
-		if readErr != nil && len(handshakeBytes) == 0 {
-			s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", readErr)
+	
+		if len(handshakeBytes) == 0 {
+			s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
 			return
 		}
 	}
