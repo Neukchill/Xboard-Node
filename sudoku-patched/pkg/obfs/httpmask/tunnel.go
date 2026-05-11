@@ -121,6 +121,10 @@ type earlyHandshakeMeta interface {
 	HTTPMaskEarlyHandshakeUplinkPacked() bool
 }
 
+type earlyHandshakeMessageReader interface {
+	HTTPMaskReadMessage(maxBytes int, timeout time.Duration) ([]byte, error)
+}
+
 type obfsMeta interface {
 	SudokuUplinkPacked() bool
 }
@@ -143,6 +147,17 @@ func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUplinkPacked() bool {
 		return false
 	}
 	return c.uplinkPacked
+}
+
+func (c *earlyHandshakeConn) HTTPMaskReadMessage(maxBytes int, timeout time.Duration) ([]byte, error) {
+	if c == nil || c.Conn == nil {
+		return nil, fmt.Errorf("nil conn")
+	}
+	reader, ok := c.Conn.(earlyHandshakeMessageReader)
+	if !ok {
+		return nil, fmt.Errorf("wrapped conn does not support websocket message reads")
+	}
+	return reader.HTTPMaskReadMessage(maxBytes, timeout)
 }
 
 func wrapEarlyHandshakeConn(conn net.Conn, userHash string, uplinkPacked bool) net.Conn {
