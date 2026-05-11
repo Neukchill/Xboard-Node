@@ -501,12 +501,6 @@ func (s *Server) handleConn(rawConn net.Conn) {
 				return
 			}
 		}
-	
-		if len(handshakeBytes) == 0 {
-			s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
-			return
-		}
-	}
 
 	if len(handshakeBytes) == 0 {
 		s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
