@@ -575,8 +575,15 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
 		matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
 
-	preBuffered := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
-	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(preBuffered, realCfg)
+	phase3Conn := current
+	if _, ok := httpmask.EarlyHandshakeUserHash(current); !ok {
+		// Only replay Phase 1 bytes for plain tunnel connections.
+		// If the connection already carries early-handshake metadata, Phase 3
+		// should continue from the live socket state instead of re-feeding the
+		// buffered bytes back into the session parser.
+		phase3Conn = sudokuapis.NewPreBufferedConn(current, handshakeBytes)
+	}
+	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(phase3Conn, realCfg)
 	if err != nil {
 	    fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
 	        matchedUser.id, err)
