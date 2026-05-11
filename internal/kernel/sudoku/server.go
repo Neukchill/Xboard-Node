@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,43 +18,6 @@ import (
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	sudokutable "github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
-
-// readHandshakeBytes reads the initial client-hello burst from conn.
-//
-// The caller must have already set a read deadline on rawConn (the underlying
-// TCP/TLS connection).  readHandshakeBytes blocks until the first chunk of
-// data arrives, then uses a 20 ms short-deadline loop to drain any additional
-// bytes that arrived in the same burst.  Because the sudoku client sends the
-// entire client hello before waiting for the server hello, all handshake bytes
-// arrive in a single burst and this function captures them completely.
-func readHandshakeBytes(conn net.Conn, rawConn net.Conn) ([]byte, error) {
-	tmp := make([]byte, 4096)
-
-	// First read: waits up to the caller-set deadline for data.
-	n, err := conn.Read(tmp)
-	if n == 0 {
-		return nil, err
-	}
-	buf := make([]byte, n, n+4096)
-	copy(buf, tmp[:n])
-	if err != nil {
-		// EOF / deadline on first read with data is fine.
-		return buf, nil
-	}
-
-	// Short-deadline reads to capture any additional buffered bytes.
-	for len(buf) < 32*1024 {
-		rawConn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-		n, err = conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break // deadline exceeded or connection gone — we have enough
-		}
-	}
-	return buf, nil
-}
 
 // NodeSettings holds node-level (shared across all users) configuration.
 type NodeSettings struct {
@@ -84,7 +48,7 @@ type userEntry struct {
 	id   int
 	uuid string
 	salt string
-	key  string              // derived: hex(sha256(uuid+salt))
+	key  string // derived: hex(sha256(uuid+salt))
 	cfg  *sudokuapis.ProtocolConfig
 }
 
@@ -397,18 +361,37 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// handleConn authenticates an incoming connection using a two-phase approach:
+// handleConn authenticates an incoming connection using incremental probing.
 //
-// Phase 1 — buffer: read all client-hello bytes into memory in one burst.
+// Design (v5):
 //
-// Phase 2 — identify: for each registered user, run ServerHandshakeCore
-// against a sinkConn (reads from bytes.Reader, writes to /dev/null).
-// This is completely stateless — every probe sees an independent copy of the
-// bytes, there are no goroutine leaks between probes, and no lock contention.
+//	After the optional HTTP-mask / WebSocket upgrade, we read bytes from the
+//	upgraded connection in small chunks and, after each chunk, probe every
+//	registered user with ProbeHandshakeDetailed. We stop reading as soon as
+//	one user matches, OR when all users definitively reject the bytes. Then
+//	we replay the buffered bytes via NewPreBufferedConn and run the full
+//	server handshake on the real connection for the matched user only.
 //
-// Phase 3 — handshake: replay the buffered bytes via NewPreBufferedConn and
-// run the full ServerHandshakeSessionAutoWithUserHash on the real connection
-// for the matched user only.
+// Why incremental (and why the earlier "buffer everything first" approach
+// broke in WebSocket mode):
+//
+//	The conn returned by httpmask in WS mode is a coder/websocket NetConn.
+//	Two facts about that NetConn make naive buffering unsafe:
+//
+//	  1. Read() never returns io.EOF at message boundaries — it silently
+//	     fetches the next message, blocking if none has arrived.  We cannot
+//	     detect "client-hello fully buffered" by reading until EOF.
+//
+//	  2. SetReadDeadline triggers a context cancellation inside coder/websocket
+//	     that the library treats as a permanent connection failure.  Once it
+//	     fires, every subsequent Read/Write returns "use of closed network
+//	     connection", even though the underlying TCP socket is still alive.
+//
+//	The incremental probe loop terminates the moment a user matches, so we
+//	never make a Read past the end of the client-hello message and never need
+//	a deadline on the NetConn.  A watchdog goroutine hard-closes the underlying
+//	rawConn after HandshakeTimeout, providing an upper bound on probe time
+//	without poisoning the WS state.
 func (s *Server) handleConn(rawConn net.Conn) {
 	defer rawConn.Close()
 
@@ -446,106 +429,98 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 	}
 
-	// ── Phase 1: buffer ──────────────────────────────────────────────────────
+	// ── Phase 1+2: incremental multi-user probe ──────────────────────────────
 	timeout := s.settings.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = 10
 	}
 
-	var handshakeBytes []byte
-
+	// Timeout strategy:
+	//   TCP/TLS mode → SetReadDeadline on rawConn (safe, classic semantics).
+	//   WS  mode     → watchdog goroutine that hard-closes rawConn on timeout.
+	//                  Setting any deadline on the WS NetConn would cancel its
+	//                  read context, which coder/websocket treats as a permanent
+	//                  failure — every subsequent Write would return
+	//                  "use of closed network connection".
+	var cancelProbe context.CancelFunc
 	if disableInnerHTTPMask {
-			// WS / stream tunnel mode.
-			//
-			// coder/websocket.NetConn.Read() 和普通 TCP 一样按 TCP 段返回，不等整条 WS 消息到齐。
-			// 客户端 hello 通常 500-600 字节，分多个 TCP 段，需要循环读直到 io.EOF（WS 消息结束）。
-			//
-			// 关键约束：绝对不能在 rawConn 上设短 deadline 再从 current(WS conn) 读——
-			// coder/websocket 把任何底层读错误视为永久连接失败，后续读全返回 EOF。
-			//
-			// 只在 current 上设置完整 handshake timeout 一次，然后循环读直到 io.EOF。
-			// 合法客户端 hello 在毫秒级到达，timeout 只对扫描器/攻击者触发。
-			// 当 timeout 触发时 WS conn 会被 coder/websocket 标记为 broken，
-			// 但此时我们本来就要 drop 这条连接（超时），所以没有问题。
-			current.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			tmp := make([]byte, 4096)
-			for len(handshakeBytes) < 32*1024 {
-				n, readErr := current.Read(tmp)
-				if n > 0 {
-					handshakeBytes = append(handshakeBytes, tmp[:n]...)
-				}
-				if readErr != nil {
-					// io.EOF = WS 消息读完（正常，所有 client hello 字节已到位）
-					// 其他错误 = 连接异常
-					if readErr != io.EOF {
-						fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
-							rawConn.RemoteAddr(), readErr)
-					}
-					break
-				}
+		var probeCtx context.Context
+		probeCtx, cancelProbe = context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
+		go func(ctx context.Context) {
+			<-ctx.Done()
+			if ctx.Err() == context.DeadlineExceeded {
+				_ = rawConn.Close()
 			}
-			current.SetReadDeadline(time.Time{})
-			if len(handshakeBytes) == 0 {
-				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/empty) remote=%s\n",
-					rawConn.RemoteAddr())
-				return
-			}
-		} else {
-			// Plain TCP / TLS mode: burst-drain 对 raw TCP 是安全的。
-			rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-			var readErr error
-			handshakeBytes, readErr = readHandshakeBytes(current, rawConn)
-			rawConn.SetReadDeadline(time.Time{})
-			if readErr != nil && len(handshakeBytes) == 0 {
-				s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", readErr)
-				return
-			}
-		}
-
-	if len(handshakeBytes) == 0 {
-		s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
-		return
+		}(probeCtx)
+	} else {
+		_ = rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 	}
 
-	// ── Phase 2: identify ────────────────────────────────────────────────────
-	// Try each user's config against an in-memory sinkConn.
-	// ServerHandshakeCore does: HTTP-mask peek → table probe → AEAD decrypt
-	// client-hello → write server-hello (discarded) → return.
-	// It does NOT read the session/OpenTCP message, so it completes entirely
-	// within the already-buffered bytes.
-	// Phase 2 uses sudokuapis.ProbeHandshake — a pure in-memory function that
-	// calls the library's internal probeHandshakeBytes directly.  It uses
-	// bytes.NewReader, starts no goroutines, and has no side effects on any
-	// connection.  This eliminates all goroutine-leak / lock-contention issues.
+	const (
+		maxProbeBytes = 64 * 1024
+		readChunk     = 4 * 1024
+	)
+	tmp := make([]byte, readChunk)
+	var probeBytes []byte
 	matchedIndex := -1
-	for i, user := range users {
-		probeCfg := user.cfg
-		if disableInnerHTTPMask {
-			inner := *user.cfg
-			inner.DisableHTTPMask = true
-			probeCfg = &inner
+
+probeLoop:
+	for {
+		// Try every user with the bytes we have so far.
+		needMore := false
+		for i, user := range users {
+			probeCfg := user.cfg
+			if disableInnerHTTPMask {
+				inner := *user.cfg
+				inner.DisableHTTPMask = true
+				probeCfg = &inner
+			}
+			err := sudokuapis.ProbeHandshakeDetailed(probeBytes, probeCfg)
+			if err == nil {
+				matchedIndex = i
+				fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d\n",
+					i, user.id, len(probeBytes))
+				break probeLoop
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+				needMore = true
+			}
 		}
-
-		probeErr := sudokuapis.ProbeHandshake(handshakeBytes, probeCfg)
-
-		fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
-			map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
-			i, user.id, len(handshakeBytes), probeErr)
-
-		if probeErr == nil {
-			matchedIndex = i
+		if !needMore {
+			fmt.Printf("[sudoku-debug] PROBE EXHAUSTED buf=%d remote=%s (all users rejected)\n",
+				len(probeBytes), rawConn.RemoteAddr())
+			break
+		}
+		if len(probeBytes) >= maxProbeBytes {
+			fmt.Printf("[sudoku-debug] PROBE MAX BYTES buf=%d remote=%s\n",
+				len(probeBytes), rawConn.RemoteAddr())
+			break
+		}
+		n, err := current.Read(tmp)
+		if n > 0 {
+			probeBytes = append(probeBytes, tmp[:n]...)
+		}
+		if err != nil {
+			fmt.Printf("[sudoku-debug] PROBE READ ERR buf=%d remote=%s err=%v\n",
+				len(probeBytes), rawConn.RemoteAddr(), err)
 			break
 		}
 	}
 
+	// Stop the watchdog (Phase 3 manages its own deadlines) and reset any
+	// TCP-mode read deadline before continuing.
+	if cancelProbe != nil {
+		cancelProbe()
+	}
+	if !disableInnerHTTPMask {
+		_ = rawConn.SetReadDeadline(time.Time{})
+	}
+
 	if matchedIndex < 0 {
-		s.log.Debug("all user configs exhausted, dropping connection", "remote", rawConn.RemoteAddr())
 		return
 	}
 
 	// ── Phase 3: real handshake ───────────────────────────────────────────────
-	// Replay the buffered bytes on top of the real connection and run the full
-	// handshake + session-message read for the matched user.
 	matchedUser := users[matchedIndex]
 	realCfg := matchedUser.cfg
 	if disableInnerHTTPMask {
@@ -559,21 +534,21 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			fmt.Printf("[sudoku-debug] PHASE3 PANIC user_id=%d r=%v\n", matchedUser.id, r)
 		}
 	}()
-	
-	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
-		matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
 
-	preBuffered := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
+	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
+		matchedUser.id, len(probeBytes), rawConn.RemoteAddr())
+
+	preBuffered := sudokuapis.NewPreBufferedConn(current, probeBytes)
 	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(preBuffered, realCfg)
 	if err != nil {
-	    fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
-	        matchedUser.id, err)
-	    return
+		fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
+			matchedUser.id, err)
+		return
 	}
 
 	fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE OK user_id=%d session=%v target=%s\n",
 		matchedUser.id, session, targetAddr)
-	
+
 	s.proxy(conn, session, targetAddr, matchedUser)
 
 	fmt.Printf("[sudoku-debug] PHASE3 PROXY EXITED user_id=%d target=%s\n",
@@ -622,10 +597,10 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 	default: // SessionForward
 		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
-	        fmt.Printf("[sudoku-debug] DIAL TARGET FAIL target=%s user_id=%d err=%v\n",
-	            targetAddr, user.id, err)
-	        s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
-	        return
+			fmt.Printf("[sudoku-debug] DIAL TARGET FAIL target=%s user_id=%d err=%v\n",
+				targetAddr, user.id, err)
+			s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
+			return
 		}
 		fmt.Printf("[sudoku-debug] DIAL TARGET OK target=%s user_id=%d\n", targetAddr, user.id)
 		defer target.Close()
