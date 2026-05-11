@@ -523,11 +523,12 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	preBuffered := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
 	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(preBuffered, realCfg)
 	if err != nil {
-		s.log.Debug("real handshake failed after probe match",
-			"user_id", matchedUser.id, "err", err)
-		return
+	    s.log.Info("real handshake failed after probe match",
+	        "user_id", matchedUser.id, "err", err)
+	    return
 	}
-
+	
+	s.log.Info("real handshake SUCCESS", "user_id", matchedUser.id, "session", session, "target", targetAddr)
 	s.proxy(conn, session, targetAddr, matchedUser)
 }
 
