@@ -447,23 +447,57 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	}
 
 	// ── Phase 1: buffer ──────────────────────────────────────────────────────
-	// Set the handshake deadline on the raw conn so it propagates through any
-	// WS/stream wrapper to the underlying TCP read.
 	timeout := s.settings.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = 10
 	}
-	rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
 
-	handshakeBytes, err := readHandshakeBytes(current, rawConn)
+	var handshakeBytes []byte
 
-	// Restore deadline regardless of outcome; Phase 3 will set its own.
-	rawConn.SetReadDeadline(time.Time{})
-
-	if err != nil && len(handshakeBytes) == 0 {
-		s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", err)
-		return
+	if disableInnerHTTPMask {
+		// WS / stream tunnel mode.
+		//
+		// coder/websocket.NetConn treats ANY read error — including a transient
+		// "i/o timeout" — as a permanent connection failure: it sends a WebSocket
+		// Close frame and marks the conn as broken. Subsequent reads then return
+		// EOF immediately.
+		//
+		// The previous burst-drain approach called rawConn.SetReadDeadline(20ms)
+		// while reading through "current" (the WS conn). That 20 ms deadline fired
+		// on the underlying TCP layer mid-frame, permanently breaking the WS conn
+		// before Phase 3 could use it.
+		//
+		// Fix: use a SINGLE timed read on "current" itself. One Read() on a WS
+		// NetConn returns exactly one complete WS message (= the full Sudoku client
+		// hello). There is no second message to drain: the client waits for the
+		// server hello before sending OpenTCP. Provided this read succeeds (it always
+		// does when the client is actively connecting), the deadline never fires and
+		// the WS conn stays healthy for Phase 3.
+		tmp := make([]byte, 64*1024)
+		current.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+		n, readErr := current.Read(tmp)
+		current.SetReadDeadline(time.Time{})
+		if n == 0 {
+			fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/tunnel) remote=%s err=%v\n",
+				rawConn.RemoteAddr(), readErr)
+			return
+		}
+		handshakeBytes = make([]byte, n)
+		copy(handshakeBytes, tmp[:n])
+	} else {
+		// Plain TCP / TLS mode.
+		// readHandshakeBytes uses short-deadline drain reads that are safe on a
+		// raw TCP conn (deadline errors don't permanently break TCP connections).
+		rawConn.SetReadDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+		var readErr error
+		handshakeBytes, readErr = readHandshakeBytes(current, rawConn)
+		rawConn.SetReadDeadline(time.Time{})
+		if readErr != nil && len(handshakeBytes) == 0 {
+			s.log.Debug("no handshake data received", "remote", rawConn.RemoteAddr(), "err", readErr)
+			return
+		}
 	}
+
 	if len(handshakeBytes) == 0 {
 		s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
 		return
