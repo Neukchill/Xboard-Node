@@ -176,7 +176,10 @@ func (s *TunnelServer) handleWS(rawConn net.Conn, req *httpRequestHeader, header
 		_ = rawConn.Close()
 		return HandleDone, nil, nil
 	}
-	outConn := net.Conn(websocket.NetConn(context.Background(), c, websocket.MessageBinary))
+	outConn := net.Conn(&wsMessageConn{
+		Conn: websocket.NetConn(context.Background(), c, websocket.MessageBinary),
+		ws:   c,
+	})
 	if prepared != nil && prepared.WrapConn != nil {
 		wrapped, err := prepared.WrapConn(outConn)
 		if err != nil {
