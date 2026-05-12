@@ -283,7 +283,6 @@ func specToEntries(users []model.UserSpec, settings NodeSettings) []userEntry {
 			uuid:     u.UUID,
 			salt:     settings.KeySalt,
 			settings: settings,
-			extras:   cloneExtras(u.Extras),
 		}
 		applyUserOverrides(&entry)
 		out = append(out, entry)
