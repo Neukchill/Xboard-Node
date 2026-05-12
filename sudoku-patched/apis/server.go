@@ -224,10 +224,14 @@ func serverHandshakeCoreWithUserHash(rawConn net.Conn, cfg *ProtocolConfig) (net
 	if err := cfg.Validate(); err != nil {
 		return nil, "", nil, fmt.Errorf("invalid config: %w", err)
 	}
-	if userHash, ok := httpmask.EarlyHandshakeUserHash(rawConn); ok {
-		fail := func(originalErr error) error { return originalErr }
-		return rawConn, userHash, fail, nil
-	}
+	// NOTE: EarlyHandshake shortcut is disabled to ensure the full KIP handshake
+	// (read client hello, write server hello, rekey) is always performed.
+	// This fixes the deadlock where the server waits for session message while
+	// the client waits for server hello.
+	//
+	// The caller (xboard-node) is responsible for buffering the client hello
+	// bytes and replaying them via PreBufferedConn so the handshake library
+	// can parse them again.
 
 	deadline := time.Now().Add(time.Duration(cfg.HandshakeTimeoutSeconds) * time.Second)
 	rawConn.SetReadDeadline(deadline)
@@ -269,6 +273,8 @@ func serverHandshakeCoreWithUserHash(rawConn net.Conn, cfg *ProtocolConfig) (net
 			ReadData:       preRead,
 		}
 	}
+	fmt.Printf("[sudoku-debug] TABLE SELECTED table=%p uplink=%s preRead=%d\n",
+		selected.Table, selected.UplinkMode, len(preRead))
 
 	baseConn := tunnel.NewPreBufferedConn(rawConn, preRead)
 	sConn, obfsConn := buildServerObfsConn(baseConn, cfg, selected.Table, selected.UplinkMode, true)
@@ -285,6 +291,8 @@ func serverHandshakeCoreWithUserHash(rawConn net.Conn, cfg *ProtocolConfig) (net
 	}
 
 	pskC2S, pskS2C := tunnel.DerivePSKDirectionalBases(cfg.Key)
+	fmt.Printf("[sudoku-debug] CRYPTO SETUP key=%s pskS2C=%x pskC2S=%x aead=%s\n",
+		cfg.Key, pskS2C[:min(8, len(pskS2C))], pskC2S[:min(8, len(pskC2S))], cfg.AEADMethod)
 	cConn, err := crypto.NewRecordConn(obfsConn, cfg.AEADMethod, pskS2C, pskC2S)
 	if err != nil {
 		return nil, "", nil, fail(fmt.Errorf("crypto setup failed: %w", err))
@@ -292,8 +300,10 @@ func serverHandshakeCoreWithUserHash(rawConn net.Conn, cfg *ProtocolConfig) (net
 
 	msg, err := tunnel.ReadKIPMessage(cConn)
 	if err != nil {
+		fmt.Printf("[sudoku-debug] READ CLIENT HELLO FAIL key=%s err=%v\n", cfg.Key[:min(8, len(cfg.Key))], err)
 		return nil, "", nil, fail(fmt.Errorf("read client hello failed: %w", err))
 	}
+	fmt.Printf("[sudoku-debug] READ CLIENT HELLO OK type=%d len=%d\n", msg.Type, len(msg.Payload))
 	if msg.Type != tunnel.KIPTypeClientHello {
 		return nil, "", nil, fail(fmt.Errorf("unexpected handshake message: %d", msg.Type))
 	}
@@ -338,12 +348,19 @@ func serverHandshakeCoreWithUserHash(rawConn net.Conn, cfg *ProtocolConfig) (net
 		ServerPub:     serverPub,
 		SelectedFeats: ch.Features,
 	}
-	if err := tunnel.WriteKIPMessage(cConn, tunnel.KIPTypeServerHello, sh.EncodePayload()); err != nil {
+	shPayload := sh.EncodePayload()
+	fmt.Printf("[sudoku-debug] SERVER HELLO WRITE key=%s nonce=%d pub=%x feats=%v\n",
+		cfg.Key[:min(8, len(cfg.Key))], sh.Nonce, sh.ServerPub[:4], sh.SelectedFeats)
+	if err := tunnel.WriteKIPMessage(cConn, tunnel.KIPTypeServerHello, shPayload); err != nil {
+		fmt.Printf("[sudoku-debug] SERVER HELLO WRITE FAIL err=%v\n", err)
 		return nil, "", nil, fail(fmt.Errorf("write server hello failed: %w", err))
 	}
+	fmt.Printf("[sudoku-debug] SERVER HELLO WRITE OK\n")
 	if err := cConn.Rekey(sessS2C, sessC2S); err != nil {
+		fmt.Printf("[sudoku-debug] REKEY FAIL err=%v\n", err)
 		return nil, "", nil, fail(fmt.Errorf("rekey failed: %w", err))
 	}
+	fmt.Printf("[sudoku-debug] REKEY OK\n")
 
 	sConn.StopRecording()
 
