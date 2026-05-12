@@ -58,12 +58,15 @@ func ServerHandshakeSessionAutoWithUserHash(rawConn net.Conn, cfg *ProtocolConfi
 		return nil, SessionForward, "", "", nil, err
 	}
 
+	fmt.Printf("[sudoku-debug] SESSION READ WAIT userHash=%s\n", userHash)
 	for {
 		msg, err := tunnel.ReadKIPMessage(conn)
 		if err != nil {
+			fmt.Printf("[sudoku-debug] SESSION READ FAIL err=%v\n", err)
 			_ = conn.Close()
 			return nil, SessionForward, "", "", nil, fail(fmt.Errorf("read session message failed: %w", err))
 		}
+		fmt.Printf("[sudoku-debug] SESSION READ OK type=%d len=%d\n", msg.Type, len(msg.Payload))
 		if msg.Type == tunnel.KIPTypeKeepAlive {
 			continue
 		}
