@@ -82,6 +82,7 @@ type UserSpec struct {
 	UUID        string
 	SpeedLimit  int
 	DeviceLimit int
+	Extras      map[string]any
 }
 
 func (n *NodeSpec) GetProxyProtocol() bool {
