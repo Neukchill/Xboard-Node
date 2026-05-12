@@ -60,6 +60,7 @@ type NodeSettings struct {
 	// Table/obfuscation settings
 	TableType          string // e.g. "up_ascii_down_entropy"
 	CustomTable        string // e.g. "vpvpvvxx" (optional)
+	CustomTables       []string
 	AEADMethod         string // "chacha20-poly1305" or "aes-128-gcm"
 	PaddingMin         int
 	PaddingMax         int
@@ -81,11 +82,13 @@ type NodeSettings struct {
 
 // userEntry represents a registered user with their derived key and protocol config.
 type userEntry struct {
-	id   int
-	uuid string
-	salt string
-	key  string              // derived: hex(sha256(uuid+salt))
-	cfg  *sudokuapis.ProtocolConfig
+	id       int
+	uuid     string
+	salt     string
+	key      string // derived: hex(sha256(uuid+salt))
+	settings NodeSettings
+	extras   map[string]any
+	cfg      *sudokuapis.ProtocolConfig
 }
 
 // deriveKey computes the per-user PSK from UUID and node salt.
@@ -94,18 +97,98 @@ func deriveKey(uuid, salt string) string {
 	return fmt.Sprintf("%x", h[:])
 }
 
+func mergeNodeSettings(base, override NodeSettings) NodeSettings {
+	merged := base
+	if override.TableType != "" {
+		merged.TableType = override.TableType
+	}
+	if override.CustomTable != "" {
+		merged.CustomTable = override.CustomTable
+	}
+	if len(override.CustomTables) > 0 {
+		merged.CustomTables = append([]string(nil), override.CustomTables...)
+		merged.CustomTable = ""
+	}
+	if override.AEADMethod != "" {
+		merged.AEADMethod = override.AEADMethod
+	}
+	if override.PaddingMin != 0 {
+		merged.PaddingMin = override.PaddingMin
+	}
+	if override.PaddingMax != 0 {
+		merged.PaddingMax = override.PaddingMax
+	}
+	if override.EnablePureDownlink {
+		merged.EnablePureDownlink = true
+	}
+	if override.HTTPMaskMode != "" {
+		merged.HTTPMaskMode = override.HTTPMaskMode
+	}
+	if override.HTTPMaskPathRoot != "" {
+		merged.HTTPMaskPathRoot = override.HTTPMaskPathRoot
+	}
+	if override.HTTPMaskMux != "" {
+		merged.HTTPMaskMux = override.HTTPMaskMux
+	}
+	if override.KeySalt != "" {
+		merged.KeySalt = override.KeySalt
+	}
+	return merged
+}
+
+func finalizeUserEntry(base NodeSettings, entry userEntry) userEntry {
+	entry.settings = mergeNodeSettings(base, entry.settings)
+	if entry.key == "" {
+		entry.key = deriveKey(entry.uuid, entry.salt)
+	}
+	entry.cfg = buildConfig(entry.key, entry.settings)
+	return entry
+}
+
+func userHandshakeHash(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("%x", h[:8])
+}
+
+func findMatchedUserNoLog(handshakeBytes []byte, users []userEntry, disableInnerHTTPMask bool) int {
+	for i, user := range users {
+		probeCfg := user.cfg
+	if disableInnerHTTPMask {
+			inner := *user.cfg
+		inner.DisableHTTPMask = true
+		probeCfg = &inner
+	}
+		if sudokuapis.ProbeHandshake(handshakeBytes, probeCfg) == nil {
+			return i
+		}
+	}
+	return -1
+}
+
 // buildConfig creates the ProtocolConfig for a single user given their key and node settings.
 func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
-	var table *sudokutable.Table
-	if s.CustomTable != "" {
-		t, err := sudokutable.NewTableWithCustom(key, s.TableType, s.CustomTable)
-		if err != nil {
-			// Fall back to standard table on invalid custom pattern
-			t = sudokutable.NewTable(key, s.TableType)
+	var (
+		table  *sudokutable.Table
+		tables []*sudokutable.Table
+	)
+	if len(s.CustomTables) > 0 {
+		tableSet, err := sudokutable.NewTableSet(key, s.TableType, s.CustomTables)
+		if err == nil && tableSet != nil && len(tableSet.Tables) > 0 {
+			tables = tableSet.Tables
+			table = tables[0]
 		}
-		table = t
-	} else {
-		table = sudokutable.NewTable(key, s.TableType)
+	}
+	if table == nil {
+		if s.CustomTable != "" {
+			t, err := sudokutable.NewTableWithCustom(key, s.TableType, s.CustomTable)
+			if err != nil {
+				// Fall back to standard table on invalid custom pattern
+				t = sudokutable.NewTable(key, s.TableType)
+			}
+			table = t
+		} else {
+			table = sudokutable.NewTable(key, s.TableType)
+		}
 	}
 
 	timeout := s.HandshakeTimeout
@@ -122,6 +205,7 @@ func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
 		Key:                     key,
 		AEADMethod:              method,
 		Table:                   table,
+		Tables:                  tables,
 		PaddingMin:              s.PaddingMin,
 		PaddingMax:              s.PaddingMax,
 		EnablePureDownlink:      s.EnablePureDownlink,
@@ -238,8 +322,7 @@ func (s *Server) Stop() {
 func (s *Server) UpdateUsers(entries []userEntry) (added, removed int) {
 	filled := make([]userEntry, 0, len(entries))
 	for _, e := range entries {
-		e.key = deriveKey(e.uuid, e.salt)
-		e.cfg = buildConfig(e.key, s.settings)
+		e = finalizeUserEntry(s.settings, e)
 		filled = append(filled, e)
 	}
 
@@ -283,8 +366,7 @@ func (s *Server) AddUsers(entries []userEntry) int {
 		if _, ok := existing[e.id]; ok {
 			continue
 		}
-		e.key = deriveKey(e.uuid, e.salt)
-		e.cfg = buildConfig(e.key, s.settings)
+		e = finalizeUserEntry(s.settings, e)
 		s.users = append(s.users, e)
 		existing[e.id] = struct{}{}
 		added++
@@ -459,30 +541,52 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	}
 
 	var handshakeBytes []byte
+	matchedIndex := -1
 
-	if disableInnerHTTPMask {
+	if earlyHash, ok := httpmask.EarlyHandshakeUserHash(current); ok {
+		for i, user := range users {
+			if userHandshakeHash(user.key) == earlyHash {
+				matchedIndex = i
+				fmt.Printf("[sudoku-debug] EARLY META MATCH user_id=%d hash=%s\n", user.id, earlyHash)
+				break
+			}
+		}
+	}
+
+	if matchedIndex < 0 && disableInnerHTTPMask {
 		if wsTunnelMode {
-			// WS tunnel mode.
-			//
-			// current is backed by coder/websocket.NetConn, which exposes stream
-			// semantics and does NOT surface per-message EOF to callers. If we keep
-			// calling Read() waiting for EOF, we'll block on the *next* WS message
-			// (OpenTCP), but the client only sends that after receiving server hello.
-			// That deadlock eventually trips the read deadline, cancels the WS reader,
-			// and breaks the conn before Phase 3 can write server hello.
-			//
-			// The fix is to read exactly one WS message here: the initial client hello.
+			// WS tunnel mode: some clients split the hello across multiple WS
+			// messages. Keep appending messages until probe can identify the user.
 			reader, ok := current.(wsMessageReader)
 			if !ok {
 				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/no-message-reader) remote=%s\n",
 					rawConn.RemoteAddr())
 				return
 			}
-			var readErr error
-			handshakeBytes, readErr = reader.HTTPMaskReadMessage(32*1024, time.Duration(timeout)*time.Second)
-			if readErr != nil {
-				fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
-					rawConn.RemoteAddr(), readErr)
+			deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+			for len(handshakeBytes) < 32*1024 {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+				chunk, readErr := reader.HTTPMaskReadMessage(32*1024-len(handshakeBytes), remaining)
+				if readErr != nil {
+					if len(handshakeBytes) == 0 {
+						fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
+							rawConn.RemoteAddr(), readErr)
+					}
+					break
+				}
+				if len(chunk) == 0 {
+					break
+				}
+				handshakeBytes = append(handshakeBytes, chunk...)
+				fmt.Printf("[sudoku-debug] PHASE1 WS APPEND remote=%s chunk=%d total=%d\n",
+					rawConn.RemoteAddr(), len(chunk), len(handshakeBytes))
+				matchedIndex = findMatchedUserNoLog(handshakeBytes, users, true)
+				if matchedIndex >= 0 {
+					break
+				}
 			}
 			if len(handshakeBytes) == 0 {
 				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/empty) remote=%s\n",
@@ -514,7 +618,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 	}
 
-	if len(handshakeBytes) == 0 {
+	if matchedIndex < 0 && len(handshakeBytes) == 0 {
 		s.log.Debug("empty handshake, dropping", "remote", rawConn.RemoteAddr())
 		return
 	}
@@ -529,25 +633,36 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	// calls the library's internal probeHandshakeBytes directly.  It uses
 	// bytes.NewReader, starts no goroutines, and has no side effects on any
 	// connection.  This eliminates all goroutine-leak / lock-contention issues.
-	matchedIndex := -1
-	for i, user := range users {
-		probeCfg := user.cfg
-		if disableInnerHTTPMask {
-			inner := *user.cfg
-			inner.DisableHTTPMask = true
-			probeCfg = &inner
+	if matchedIndex < 0 {
+		for i, user := range users {
+			probeCfg := user.cfg
+			if disableInnerHTTPMask {
+				inner := *user.cfg
+				inner.DisableHTTPMask = true
+				probeCfg = &inner
+			}
+			probeErr := sudokuapis.ProbeHandshake(handshakeBytes, probeCfg)
+
+			fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
+				map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
+				i, user.id, len(handshakeBytes), probeErr)
+
+			if probeErr == nil {
+				if extraKeys := debugExtraKeys(user.extras); extraKeys != "" {
+					fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
+						i, user.id, extraKeys)
+				}
+				matchedIndex = i
+				break
+			}
 		}
-
-		probeErr := sudokuapis.ProbeHandshake(handshakeBytes, probeCfg)
-
-		fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
-			map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
-			i, user.id, len(handshakeBytes), probeErr)
-
-		if probeErr == nil {
-			matchedIndex = i
-			break
+	} else {
+		if extraKeys := debugExtraKeys(users[matchedIndex].extras); extraKeys != "" {
+			fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
+				matchedIndex, users[matchedIndex].id, extraKeys)
 		}
+		fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d err=<nil>\n",
+			matchedIndex, users[matchedIndex].id, len(handshakeBytes))
 	}
 
 	if matchedIndex < 0 {
@@ -558,6 +673,15 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	// ── Phase 3: real handshake ───────────────────────────────────────────────
 	// Replay the buffered bytes on top of the real connection and run the full
 	// handshake + session-message read for the matched user.
+	//
+	// IMPORTANT: Always use PreBufferedConn even when EarlyHandshakeUserHash
+	// matched. The early-handshake shortcut inside serverHandshakeCoreWithUserHash
+	// skips the entire handshake (read client hello, write server hello, rekey).
+	// Without PreBufferedConn, Phase 3 has no bytes to replay, causing the
+	// client to wait forever for server hello while the server waits for the
+	// session message — a deadlock.  By always using PreBufferedConn, we bypass
+	// the shortcut and let the handshake library read from the buffered bytes,
+	// completing the full KIP exchange correctly.
 	matchedUser := users[matchedIndex]
 	realCfg := matchedUser.cfg
 	if disableInnerHTTPMask {
@@ -566,23 +690,35 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		realCfg = &inner
 	}
 
+	// Debug: output user config details
+	extrasKeys := debugExtraKeys(matchedUser.extras)
+	fmt.Printf("[sudoku-debug] USER CONFIG user_id=%d uuid=%s key=%s salt=%s extras=[%s] tableType=%s aead=%s padding=[%d,%d] httpmask=%s\n",
+		matchedUser.id,
+		matchedUser.uuid,
+		matchedUser.key[:min(16, len(matchedUser.key))],
+		matchedUser.salt[:min(8, len(matchedUser.salt))],
+		extrasKeys,
+		matchedUser.settings.TableType,
+		matchedUser.settings.AEADMethod,
+		matchedUser.settings.PaddingMin,
+		matchedUser.settings.PaddingMax,
+		matchedUser.settings.HTTPMaskMode,
+	)
+
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("[sudoku-debug] PHASE3 PANIC user_id=%d r=%v\n", matchedUser.id, r)
 		}
 	}()
-	
+
 	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
 		matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
 
-	phase3Conn := current
-	if _, ok := httpmask.EarlyHandshakeUserHash(current); !ok {
-		// Only replay Phase 1 bytes for plain tunnel connections.
-		// If the connection already carries early-handshake metadata, Phase 3
-		// should continue from the live socket state instead of re-feeding the
-		// buffered bytes back into the session parser.
-		phase3Conn = sudokuapis.NewPreBufferedConn(current, handshakeBytes)
-	}
+	// Phase 1 (HTTPMaskReadMessage) consumed the client hello from the WebSocket
+	// stream and cached it in handshakeBytes.  PreBufferedConn replays those bytes
+	// so the handshake library can parse the client hello again, write server
+	// hello back, and rekey — completing the full KIP handshake.
+	phase3Conn := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
 	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(phase3Conn, realCfg)
 	if err != nil {
 	    fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
