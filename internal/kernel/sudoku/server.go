@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -855,17 +854,4 @@ func (c *countingConn) Write(b []byte) (n int, err error) {
 		c.srv.addTraffic(c.userID, int64(n), 0)
 	}
 	return
-}
-
-// debugExtraKeys returns a comma-separated list of extras map keys for debugging.
-func debugExtraKeys(extras map[string]any) string {
-	if len(extras) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(extras))
-	for key := range extras {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return strings.Join(keys, ",")
 }
