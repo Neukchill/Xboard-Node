@@ -56,7 +56,7 @@ cert:
 # Logging settings
 log:
   # Node log level: debug/info/warn/error (default: info)
-  level: "info"
+  level: "error"
   # Log output: stdout/stderr or file path (default: stdout)
   output: "stdout"
 
