@@ -547,7 +547,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		for i, user := range users {
 			if userHandshakeHash(user.key) == earlyHash {
 				matchedIndex = i
-				fmt.Printf("[sudoku-debug] EARLY META MATCH user_id=%d hash=%s\n", user.id, earlyHash)
+				// fmt.Printf("[sudoku-debug] EARLY META MATCH user_id=%d hash=%s\n", user.id, earlyHash)
 				break
 			}
 		}
@@ -559,8 +559,8 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			// messages. Keep appending messages until probe can identify the user.
 			reader, ok := current.(wsMessageReader)
 			if !ok {
-				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/no-message-reader) remote=%s\n",
-					rawConn.RemoteAddr())
+				// fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/no-message-reader) remote=%s\n",
+				// 	rawConn.RemoteAddr())
 				return
 			}
 			deadline := time.Now().Add(time.Duration(timeout) * time.Second)
@@ -572,8 +572,8 @@ func (s *Server) handleConn(rawConn net.Conn) {
 				chunk, readErr := reader.HTTPMaskReadMessage(32*1024-len(handshakeBytes), remaining)
 				if readErr != nil {
 					if len(handshakeBytes) == 0 {
-						fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
-							rawConn.RemoteAddr(), readErr)
+						// fmt.Printf("[sudoku-debug] PHASE1 READ ERR (ws) remote=%s err=%v\n",
+						// 	rawConn.RemoteAddr(), readErr)
 					}
 					break
 				}
@@ -581,16 +581,16 @@ func (s *Server) handleConn(rawConn net.Conn) {
 					break
 				}
 				handshakeBytes = append(handshakeBytes, chunk...)
-				fmt.Printf("[sudoku-debug] PHASE1 WS APPEND remote=%s chunk=%d total=%d\n",
-					rawConn.RemoteAddr(), len(chunk), len(handshakeBytes))
+				// fmt.Printf("[sudoku-debug] PHASE1 WS APPEND remote=%s chunk=%d total=%d\n",
+				// 	rawConn.RemoteAddr(), len(chunk), len(handshakeBytes))
 				matchedIndex = findMatchedUserNoLog(handshakeBytes, users, true)
 				if matchedIndex >= 0 {
 					break
 				}
 			}
 			if len(handshakeBytes) == 0 {
-				fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/empty) remote=%s\n",
-					rawConn.RemoteAddr())
+				// fmt.Printf("[sudoku-debug] PHASE1 FAIL (ws/empty) remote=%s\n",
+				// 	rawConn.RemoteAddr())
 				return
 			}
 		} else {
@@ -643,14 +643,14 @@ func (s *Server) handleConn(rawConn net.Conn) {
 			}
 			probeErr := sudokuapis.ProbeHandshake(handshakeBytes, probeCfg)
 
-			fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
-				map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
-				i, user.id, len(handshakeBytes), probeErr)
+			// fmt.Printf("[sudoku-debug] PROBE %s index=%d user_id=%d buf=%d err=%v\n",
+			// 	map[bool]string{true: "SUCCESS", false: "FAIL"}[probeErr == nil],
+			// 	i, user.id, len(handshakeBytes), probeErr)
 
 			if probeErr == nil {
 				if extraKeys := debugExtraKeys(user.extras); extraKeys != "" {
-					fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
-						i, user.id, extraKeys)
+					// fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
+					// 	i, user.id, extraKeys)
 				}
 				matchedIndex = i
 				break
@@ -658,11 +658,11 @@ func (s *Server) handleConn(rawConn net.Conn) {
 		}
 	} else {
 		if extraKeys := debugExtraKeys(users[matchedIndex].extras); extraKeys != "" {
-			fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
-				matchedIndex, users[matchedIndex].id, extraKeys)
+			// fmt.Printf("[sudoku-debug] USER EXTRAS MATCH index=%d user_id=%d keys=%s\n",
+			// 	matchedIndex, users[matchedIndex].id, extraKeys)
 		}
-		fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d err=<nil>\n",
-			matchedIndex, users[matchedIndex].id, len(handshakeBytes))
+		// fmt.Printf("[sudoku-debug] PROBE SUCCESS index=%d user_id=%d buf=%d err=<nil>\n",
+		// 	matchedIndex, users[matchedIndex].id, len(handshakeBytes))
 	}
 
 	if matchedIndex < 0 {
@@ -692,27 +692,29 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 	// Debug: output user config details
 	extrasKeys := debugExtraKeys(matchedUser.extras)
-	fmt.Printf("[sudoku-debug] USER CONFIG user_id=%d uuid=%s key=%s salt=%s extras=[%s] tableType=%s aead=%s padding=[%d,%d] httpmask=%s\n",
-		matchedUser.id,
-		matchedUser.uuid,
-		matchedUser.key[:min(16, len(matchedUser.key))],
-		matchedUser.salt[:min(8, len(matchedUser.salt))],
-		extrasKeys,
-		matchedUser.settings.TableType,
-		matchedUser.settings.AEADMethod,
-		matchedUser.settings.PaddingMin,
-		matchedUser.settings.PaddingMax,
-		matchedUser.settings.HTTPMaskMode,
-	)
+	// fmt.Printf("[sudoku-debug] USER CONFIG user_id=%d uuid=%s key=%s salt=%s extras=[%s] tableType=%s aead=%s padding=[%d,%d] httpmask=%s\n",
+	// 	matchedUser.id,
+	// 	matchedUser.uuid,
+	// 	matchedUser.key[:min(16, len(matchedUser.key))],
+	// 	matchedUser.salt[:min(8, len(matchedUser.salt))],
+	// 	extrasKeys,
+	// 	matchedUser.settings.TableType,
+	// 	matchedUser.settings.AEADMethod,
+	// 	matchedUser.settings.PaddingMin,
+	// 	matchedUser.settings.PaddingMax,
+	// 	matchedUser.settings.HTTPMaskMode,
+	// )
+	_ = extrasKeys // avoid unused variable warning
 
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("[sudoku-debug] PHASE3 PANIC user_id=%d r=%v\n", matchedUser.id, r)
+			// fmt.Printf("[sudoku-debug] PHASE3 PANIC user_id=%d r=%v\n", matchedUser.id, r)
+			_ = r
 		}
 	}()
 
-	fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
-		matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
+	// fmt.Printf("[sudoku-debug] PHASE3 BEGIN user_id=%d buf=%d remote=%s\n",
+	// 	matchedUser.id, len(handshakeBytes), rawConn.RemoteAddr())
 
 	// Phase 1 (HTTPMaskReadMessage) consumed the client hello from the WebSocket
 	// stream and cached it in handshakeBytes.  PreBufferedConn replays those bytes
@@ -721,18 +723,18 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	phase3Conn := sudokuapis.NewPreBufferedConn(current, handshakeBytes)
 	conn, session, targetAddr, _, _, err := sudokuapis.ServerHandshakeSessionAutoWithUserHash(phase3Conn, realCfg)
 	if err != nil {
-	    fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
-	        matchedUser.id, err)
+	    // fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE FAIL user_id=%d err=%v\n",
+	    //     matchedUser.id, err)
 	    return
 	}
 
-	fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE OK user_id=%d session=%v target=%s\n",
-		matchedUser.id, session, targetAddr)
-	
+	// fmt.Printf("[sudoku-debug] PHASE3 HANDSHAKE OK user_id=%d session=%v target=%s\n",
+	// 	matchedUser.id, session, targetAddr)
+
 	s.proxy(conn, session, targetAddr, matchedUser)
 
-	fmt.Printf("[sudoku-debug] PHASE3 PROXY EXITED user_id=%d target=%s\n",
-		matchedUser.id, targetAddr)
+	// fmt.Printf("[sudoku-debug] PHASE3 PROXY EXITED user_id=%d target=%s\n",
+	// 	matchedUser.id, targetAddr)
 }
 
 // proxy relays traffic between the authenticated tunnel connection and the target.
@@ -777,12 +779,12 @@ func (s *Server) proxy(conn net.Conn, session sudokuapis.SessionKind, targetAddr
 	default: // SessionForward
 		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
-	        fmt.Printf("[sudoku-debug] DIAL TARGET FAIL target=%s user_id=%d err=%v\n",
-	            targetAddr, user.id, err)
+	        // fmt.Printf("[sudoku-debug] DIAL TARGET FAIL target=%s user_id=%d err=%v\n",
+	        //     targetAddr, user.id, err)
 	        s.log.Error("dial target failed", "target", targetAddr, "uuid", user.uuid, "err", err)
 	        return
 		}
-		fmt.Printf("[sudoku-debug] DIAL TARGET OK target=%s user_id=%d\n", targetAddr, user.id)
+		// fmt.Printf("[sudoku-debug] DIAL TARGET OK target=%s user_id=%d\n", targetAddr, user.id)
 		defer target.Close()
 
 		up, dn := relay(conn, target)
