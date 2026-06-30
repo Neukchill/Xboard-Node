@@ -136,12 +136,12 @@ func mergeNodeSettings(base, override NodeSettings) NodeSettings {
 	return merged
 }
 
-func finalizeUserEntry(base NodeSettings, entry userEntry) userEntry {
+func finalizeUserEntry(base NodeSettings, entry userEntry, tableCache map[string]*cachedTableSet, cacheMu *sync.RWMutex) userEntry {
 	entry.settings = mergeNodeSettings(base, entry.settings)
 	if entry.key == "" {
 		entry.key = deriveKey(entry.uuid, entry.salt)
 	}
-	entry.cfg = buildConfig(entry.key, entry.settings)
+	entry.cfg = buildConfig(entry.key, entry.settings, tableCache, cacheMu)
 	return entry
 }
 
@@ -165,12 +165,24 @@ func findMatchedUserNoLog(handshakeBytes []byte, users []userEntry, disableInner
 	return -1
 }
 
-// buildConfig creates the ProtocolConfig for a single user given their key and node settings.
-func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
-	var (
-		table  *sudokutable.Table
-		tables []*sudokutable.Table
-	)
+type cachedTableSet struct {
+	table  *sudokutable.Table
+	tables []*sudokutable.Table
+}
+
+// lookupOrBuildTables returns cached tables or builds and caches them.
+func lookupOrBuildTables(key string, s NodeSettings, tableCache map[string]*cachedTableSet, cacheMu *sync.RWMutex) (table *sudokutable.Table, tables []*sudokutable.Table) {
+	cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s:%v", key, s.TableType, s.CustomTable, s.CustomTables))))
+
+	if cacheMu != nil && tableCache != nil {
+		cacheMu.RLock()
+		if entry, ok := tableCache[cacheKey]; ok {
+			cacheMu.RUnlock()
+			return entry.table, entry.tables
+		}
+		cacheMu.RUnlock()
+	}
+
 	if len(s.CustomTables) > 0 {
 		tableSet, err := sudokutable.NewTableSet(key, s.TableType, s.CustomTables)
 		if err == nil && tableSet != nil && len(tableSet.Tables) > 0 {
@@ -182,7 +194,6 @@ func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
 		if s.CustomTable != "" {
 			t, err := sudokutable.NewTableWithCustom(key, s.TableType, s.CustomTable)
 			if err != nil {
-				// Fall back to standard table on invalid custom pattern
 				t = sudokutable.NewTable(key, s.TableType)
 			}
 			table = t
@@ -190,6 +201,19 @@ func buildConfig(key string, s NodeSettings) *sudokuapis.ProtocolConfig {
 			table = sudokutable.NewTable(key, s.TableType)
 		}
 	}
+
+	if cacheMu != nil && tableCache != nil && table != nil {
+		cacheMu.Lock()
+		tableCache[cacheKey] = &cachedTableSet{table: table, tables: tables}
+		cacheMu.Unlock()
+	}
+
+	return table, tables
+}
+
+// buildConfig creates the ProtocolConfig for a single user given their key and node settings.
+func buildConfig(key string, s NodeSettings, tableCache map[string]*cachedTableSet, cacheMu *sync.RWMutex) *sudokuapis.ProtocolConfig {
+	table, tables := lookupOrBuildTables(key, s, tableCache, cacheMu)
 
 	timeout := s.HandshakeTimeout
 	if timeout <= 0 {
@@ -257,18 +281,23 @@ type Server struct {
 	conns      map[string]*connRecord
 	activeConn atomic.Int64
 	totalConn  atomic.Int64
+
+	// Table cache to avoid recreating tables on every UpdateUsers call
+	tableCacheMu sync.RWMutex
+	tableCache   map[string]*cachedTableSet // key: sha256(key+tableType+customTable)
 }
 
 // NewServer creates a Server (not yet started).
 func NewServer(settings NodeSettings, log *slog.Logger) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		settings: settings,
-		log:      log,
-		ctx:      ctx,
-		cancel:   cancel,
-		traffic:  make(map[int]*trafficCounter),
-		conns:    make(map[string]*connRecord),
+		settings:   settings,
+		log:        log,
+		ctx:        ctx,
+		cancel:     cancel,
+		traffic:    make(map[int]*trafficCounter),
+		conns:      make(map[string]*connRecord),
+		tableCache: make(map[string]*cachedTableSet),
 	}
 }
 
@@ -322,7 +351,7 @@ func (s *Server) Stop() {
 func (s *Server) UpdateUsers(entries []userEntry) (added, removed int) {
 	filled := make([]userEntry, 0, len(entries))
 	for _, e := range entries {
-		e = finalizeUserEntry(s.settings, e)
+		e = finalizeUserEntry(s.settings, e, s.tableCache, &s.tableCacheMu)
 		filled = append(filled, e)
 	}
 
@@ -366,7 +395,7 @@ func (s *Server) AddUsers(entries []userEntry) int {
 		if _, ok := existing[e.id]; ok {
 			continue
 		}
-		e = finalizeUserEntry(s.settings, e)
+		e = finalizeUserEntry(s.settings, e, s.tableCache, &s.tableCacheMu)
 		s.users = append(s.users, e)
 		existing[e.id] = struct{}{}
 		added++
