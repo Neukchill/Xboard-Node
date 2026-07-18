@@ -89,3 +89,31 @@ jobs:
         with:
           name: xboard-node-linux-amd64
           path: dist/xboard-node
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build ARM64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o xboard-node-linux-arm64 .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xboard-node-linux-arm64
+          path: xboard-node-linux-arm64
