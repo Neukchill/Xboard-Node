@@ -412,8 +412,15 @@ func (m *Manager) buildDNSSolver() (*certmagic.DNS01Solver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{DNSProvider: provider}}, nil
-}
+	return &certmagic.DNS01Solver{
+    DNSManager: certmagic.DNSManager{
+        DNSProvider: provider,
+        Resolvers: []string{
+            "1.1.1.1:53",
+            "8.8.8.8:53",
+        },
+    },
+}, nil
 
 func (m *Manager) newDNSProvider() (certmagic.DNSProvider, error) {
 	name := strings.ToLower(strings.TrimSpace(m.cfg.DNSProvider))
