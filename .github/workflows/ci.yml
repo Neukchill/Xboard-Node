@@ -84,11 +84,18 @@ jobs:
             go build -trimpath -ldflags="-s -w" \
             -o dist/xboard-node ./cmd/xboard-node
 
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/xboard-node-linux-amd64
+
       - name: Upload Artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: xboard-node-linux-amd64
-          path: dist/xboard-node
+          path: dist/xboard-node-linux-amd64
 
   build-linux-arm64:
     name: Build Linux ARM64
@@ -111,11 +118,18 @@ jobs:
             go build -trimpath -ldflags="-s -w" \
             -o dist/xboard-node ./cmd/xboard-node
 
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/xboard-node-linux-arm64
+
       - name: Upload Artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: xboard-node-linux-arm64
-          path: dist/xboard-node
+          path: dist/xboard-node-arm64
 
   release:
     name: Release
