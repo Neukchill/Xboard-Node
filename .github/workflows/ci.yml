@@ -2,59 +2,111 @@ name: CI
 
 on:
   push:
-    branches: [main, master, dev]
-    tags: ["v*"]
+    branches:
+      - main
+      - master
+      - dev
+    tags:
+      - "v*"
   pull_request:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  packages: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
-    name: Test
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v5
+
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version: "1.26"
           cache: true
-      - name: Debug module state
-        run: |
-          echo "=== probe.go ==="
-          cat sudoku-patched/apis/probe.go || echo "NOT FOUND"
-          echo "=== go.mod replace ==="
-          grep -A1 "SUDOKU\|sudoku-patched" go.mod || echo "NOT FOUND"
-          echo "=== go build apis ==="
-          go build github.com/SUDOKU-ASCII/sudoku/apis && echo "OK" || echo "FAIL"
-          echo "=== go version ==="
-          go version
-      - name: Run tests
+
+      - name: Run Tests
         run: make test
 
-  build-docker:
-    name: Build and Push Docker Image
-    runs-on: ubuntu-latest
+  build-amd64:
     needs: test
-    permissions:
-      contents: read
-      packages: write
+    runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build AMD64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dist/xboard-node-linux-amd64 \
+            ./cmd/xboard-node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xboard-node-linux-amd64
+          path: dist/xboard-node-linux-amd64
+
+  build-arm64:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build ARM64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dist/xboard-node-linux-arm64 \
+            ./cmd/xboard-node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xboard-node-linux-arm64
+          path: dist/xboard-node-linux-arm64
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build and push
-        uses: docker/build-push-action@v5
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
@@ -62,109 +114,29 @@ jobs:
           tags: |
             ghcr.io/neukchill/xboard-node:latest
             ghcr.io/neukchill/xboard-node:${{ github.sha }}
-            
-  build-binary:
-    name: Build Linux Binary
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-
-      - name: Build
-        run: |
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o dist/xboard-node ./cmd/xboard-node
-
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/xboard-node-linux-amd64
-
-      - name: Upload Artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: xboard-node-linux-amd64
-          path: dist/xboard-node-linux-amd64
-
-  build-linux-arm64:
-    name: Build Linux ARM64
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-
-      - name: Build ARM64
-        run: |
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" \
-            -o dist/xboard-node ./cmd/xboard-node
-
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/xboard-node-linux-arm64
-
-      - name: Upload Artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: xboard-node-linux-arm64
-          path: dist/xboard-node-arm64
 
   release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs:
-      - build-binary
-      - build-linux-arm64
-
-    permissions:
-      contents: write
-
     if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build-amd64
+      - build-arm64
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Download amd64 artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: xboard-node-linux-amd64
           path: dist
 
-      - name: Download arm64 artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: xboard-node-linux-arm64
-          path: dist-arm64
+          path: dist
 
-      - name: Rename binaries
-        run: |
-          mv dist/xboard-node dist/xboard-node-linux-amd64
-          mv dist-arm64/xboard-node dist/xboard-node-linux-arm64
-
-      - name: Publish Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             dist/xboard-node-linux-amd64
             dist/xboard-node-linux-arm64
-          generate_release_notes: true
